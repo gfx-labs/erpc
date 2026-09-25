@@ -9,6 +9,7 @@ plan fully before starting, honor its STOP conditions, and update your row when 
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
 | 001  | Dynamic config controller foundation | P1 | L | — | TODO |
+| 002  | venn parity for indexing (cache fill, tiers, head lease, websocket subscriptions) | P1 | L | — | IN PROGRESS (`feat/venn-features`) |
 
 ## Dependency notes
 
