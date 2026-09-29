@@ -33,6 +33,10 @@ type scriptedEvmUpstream struct {
 	// hashCalls counts eth_getBlockByNumber calls per explicit number
 	blockCalls    sync.Map
 	rangeLogCalls atomic.Int64
+	// logFilters counts eth_getLogs calls per compacted filter JSON, so a
+	// test can prove its own request reached the upstream despite the
+	// hydrator's concurrent blockHash fetches.
+	logFilters sync.Map
 }
 
 var scriptedEmitter = "0x5fbdb2315678afecb367f032d93f642f64180aa3"
@@ -87,6 +91,25 @@ func (u *scriptedEvmUpstream) BlockCalls(n int64) int64 {
 
 // RangeLogCalls counts eth_getLogs calls that used fromBlock/toBlock.
 func (u *scriptedEvmUpstream) RangeLogCalls() int64 { return u.rangeLogCalls.Load() }
+
+// LogFilterCalls counts eth_getLogs calls whose filter equals filterJSON
+// (compared after JSON compaction).
+func (u *scriptedEvmUpstream) LogFilterCalls(filterJSON string) int64 {
+	v, ok := u.logFilters.Load(compactJSON([]byte(filterJSON)))
+	if !ok {
+		return 0
+	}
+	return v.(*atomic.Int64).Load()
+}
+
+func compactJSON(raw []byte) string {
+	var v interface{}
+	if json.Unmarshal(raw, &v) != nil {
+		return string(raw)
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
+}
 
 func (u *scriptedEvmUpstream) HashAt(n int64) string {
 	u.mu.Lock()
@@ -232,6 +255,10 @@ func (u *scriptedEvmUpstream) handle(raw []byte) json.RawMessage {
 			}
 		}
 	case "eth_getLogs":
+		if len(req.Params) > 0 {
+			fc, _ := u.logFilters.LoadOrStore(compactJSON(req.Params[0]), &atomic.Int64{})
+			fc.(*atomic.Int64).Add(1)
+		}
 		var flt map[string]interface{}
 		_ = json.Unmarshal(req.Params[0], &flt)
 		logs := []interface{}{}

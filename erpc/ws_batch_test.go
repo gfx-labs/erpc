@@ -43,8 +43,9 @@ func dialRaw(t *testing.T, base string) *websocket.Conn {
 }
 
 // The WS endpoint is subscription-only: batches get one -32600 reply, any
-// method other than eth_subscribe/eth_unsubscribe gets -32601, and neither
-// reaches an upstream or creates a subscription.
+// method other than eth_subscribe/eth_unsubscribe gets -32601, malformed
+// single frames get -32700 (not JSON) or -32600 (JSON but not a request), and
+// none of them reaches an upstream or creates a subscription.
 func TestWs_UnsupportedContract(t *testing.T) {
 	up := newScriptedEvmUpstream(123, 20)
 	defer up.Close()
@@ -72,6 +73,21 @@ func TestWs_UnsupportedContract(t *testing.T) {
 		require.Equal(t, `"x"`, string(r.ID))
 		require.Equal(t, -32601, r.Error.Code, m)
 	}
+	for _, invalid := range []struct {
+		frame string
+		code  int
+	}{
+		{`{"jsonrpc"`, -32700},
+		{`17`, -32600},
+		{`"x"`, -32600},
+		{`{"foo":1}`, -32600},
+	} {
+		r = wsMsg{}
+		require.NoError(t, json.Unmarshal(wsRaw(t, c, invalid.frame), &r), invalid.frame)
+		require.NotNil(t, r.Error, invalid.frame)
+		require.Equal(t, invalid.code, r.Error.Code, invalid.frame)
+		require.Equal(t, "null", string(r.ID), invalid.frame)
+	}
 	// Project method lists still apply to the supported methods.
 	require.NoError(t, json.Unmarshal(wsRaw(t, c, `{"jsonrpc":"2.0","id":5,"method":"eth_unsubscribe","params":["0x1"]}`), &r))
 	require.Equal(t, -32601, r.Error.Code)
@@ -82,16 +98,6 @@ func TestWs_UnsupportedContract(t *testing.T) {
 	r = wsMsg{}
 	require.NoError(t, json.Unmarshal(wsRaw(t, c, `{"jsonrpc":"2.0","id":9,"method":"eth_subscribe","params":["newHeads"]}`), &r))
 	require.Nil(t, r.Error)
-}
-
-func TestWs_SingleInvalidRequestCodes(t *testing.T) {
-	c, _ := testWsConn(t, 4)
-	for msg, code := range map[string]int{`17`: -32600, `{"foo":1}`: -32600, `"x"`: -32600, `{"jsonrpc"`: -32700, `[{"jsonrpc":"2.0","id":1,"method":"eth_subscribe"}]`: -32600} {
-		reply, _ := c.handleOne([]byte(msg))
-		var r wsMsg
-		require.NoError(t, json.Unmarshal(reply, &r))
-		require.Equal(t, code, r.Error.Code, msg)
-	}
 }
 
 func TestWs_ConfigFallbacks(t *testing.T) {
@@ -201,6 +207,11 @@ func TestWs_UnauthorizedUpgradeDoesNotCreateNetwork(t *testing.T) {
 	w, _, err := dialWs(t, wsURL(base, "secret=s3cret"), http.Header{"Origin": {"https://good.example"}})
 	require.NoError(t, err)
 	require.Nil(t, w.call("eth_subscribe", `["newHeads"]`).Error)
+
+	// The secret may also arrive as a header (non-browser clients).
+	hdr, _, err := dialWs(t, wsURL(base, ""), http.Header{"X-ERPC-Secret-Token": {"s3cret"}})
+	require.NoError(t, err)
+	require.Nil(t, hdr.call("eth_subscribe", `["newHeads"]`).Error)
 }
 
 // Regression: a subscribe whose id reply is never delivered must release the
@@ -258,7 +269,16 @@ func TestWs_DisconnectReleasesResources(t *testing.T) {
 	subs := func() float64 {
 		return promUtil.ToFloat64(telemetry.MetricWsSubscriptions.WithLabelValues("test_project", "evm:123", "newHeads"))
 	}
-	conns0, subs0 := conns(), subs()
+	// An abrupt close racing pending reply writes may be classified as
+	// client or slow_consumer (write failure); either way it is counted once.
+	closes := func() float64 {
+		total := 0.0
+		for _, reason := range []string{"client", "slow_consumer", "error", "shutdown"} {
+			total += promUtil.ToFloat64(telemetry.MetricWsClosedTotal.WithLabelValues("test_project", "evm:123", reason))
+		}
+		return total
+	}
+	conns0, subs0, closes0 := conns(), subs(), closes()
 
 	for round := 0; round < 3; round++ {
 		var c *websocket.Conn
@@ -279,4 +299,8 @@ func TestWs_DisconnectReleasesResources(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return subCount(t, e) == 0 && conns() == conns0 && subs() == subs0
 	}, 10*time.Second, 20*time.Millisecond, "subs=%d conns=%v subsGauge=%v", subCount(t, e), conns(), subs())
+	// The connections gauge drops only after writeLoop recorded the close, so
+	// every disconnect is already counted. Baseline delta: other tests share
+	// this label set.
+	require.Equal(t, float64(3), closes()-closes0)
 }

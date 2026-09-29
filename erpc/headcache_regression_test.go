@@ -77,9 +77,13 @@ func TestHttp_HeadCache_MalformedFiltersBypassAndTopicPositionsMatchGeth(t *test
 		`{"blockHash":"0x12"}`,
 	} {
 		t.Run(filter, func(t *testing.T) {
-			request := common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[` + filter + `]}`))
-			_, hit := network.tryServeHeadCache(t.Context(), request, "eth_getLogs")
-			require.False(t, hit, "invalid filter must reach normal upstream validation")
+			// Invalid filters are never answered by the head cache: the
+			// exact client filter is forwarded to the upstream, whose own
+			// validation decides (the scripted node is lenient). Counting
+			// by exact filter excludes the hydrator's blockHash fetches.
+			before := up.LogFilterCalls(filter)
+			doRpc(t, send, "eth_getLogs", "["+filter+"]")
+			require.Equal(t, before+1, up.LogFilterCalls(filter), "invalid filter must reach the upstream unchanged")
 		})
 	}
 }

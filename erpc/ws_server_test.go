@@ -12,8 +12,10 @@ import (
 	"github.com/coder/websocket"
 	"github.com/erpc/erpc/common"
 	"github.com/erpc/erpc/headcache"
+	"github.com/erpc/erpc/telemetry"
 	"github.com/erpc/erpc/util"
 	"github.com/golang-jwt/jwt/v4"
+	promUtil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -156,6 +158,10 @@ func TestWs_SubscriptionsReorg(t *testing.T) {
 
 	w, _, err := dialWs(t, wsURL(base, ""), nil)
 	require.NoError(t, err)
+	notified := func(kind string) float64 {
+		return promUtil.ToFloat64(telemetry.MetricWsNotificationsTotal.WithLabelValues("test_project", "evm:123", kind))
+	}
+	heads0, logs0 := notified("newHeads"), notified("logs")
 
 	heads := w.call("eth_subscribe", `["newHeads"]`)
 	require.Nil(t, heads.Error)
@@ -188,6 +194,12 @@ func TestWs_SubscriptionsReorg(t *testing.T) {
 	add := w.next(evenId)
 	require.Contains(t, string(add), up.HashAt(22))
 	require.Contains(t, string(add), `"removed":false`)
+	// Delivered notifications are counted per kind: at least 3 heads (0x15,
+	// 0x16, then the reorged tip) and 3 logs (22a, removed 22a, 22b). The
+	// counter increments right after enqueue, so wait for it.
+	require.Eventually(t, func() bool {
+		return notified("newHeads")-heads0 >= 3 && notified("logs")-logs0 >= 3
+	}, 5*time.Second, 20*time.Millisecond, "heads=%v logs=%v", notified("newHeads")-heads0, notified("logs")-logs0)
 
 	// Unsubscribe is connection-scoped.
 	other, _, err := dialWs(t, wsURL(base, ""), nil)
@@ -206,42 +218,14 @@ func TestWs_SubscriptionsReorg(t *testing.T) {
 
 	// Disconnect releases head cache subscriptions.
 	require.Equal(t, 1, subCount(t, e))
+	clientCloses := func() float64 {
+		return promUtil.ToFloat64(telemetry.MetricWsClosedTotal.WithLabelValues("test_project", "evm:123", "client"))
+	}
+	closes0 := clientCloses()
 	_ = w.c.Close(websocket.StatusNormalClosure, "")
 	require.Eventually(t, func() bool { return subCount(t, e) == 0 }, 5*time.Second, 20*time.Millisecond)
-}
-
-func TestWs_AuthOriginAndDisabled(t *testing.T) {
-	up := newScriptedEvmUpstream(123, 20)
-	defer up.Close()
-	cfg := wsHeadCacheCfg(up, &common.WebSocketServerConfig{Enabled: true, PingInterval: common.Duration(200 * time.Millisecond)})
-	cfg.Projects[0].Auth = &common.AuthConfig{Strategies: []*common.AuthStrategyConfig{
-		{Type: common.AuthTypeSecret, Secret: &common.SecretStrategyConfig{Id: "s1", Value: "s3cret"}},
-	}}
-	cfg.Projects[0].CORS = &common.CORSConfig{AllowedOrigins: []string{"https://good.example"}}
-	_, _, base, shutdown, _ := createServerTestFixtures(cfg, t)
-	defer shutdown()
-
-	_, resp, err := dialWs(t, wsURL(base, ""), nil)
-	require.Error(t, err)
-	require.NotNil(t, resp)
-	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
-
-	_, resp, err = dialWs(t, wsURL(base, "secret=wrong"), nil)
-	require.Error(t, err)
-	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
-
-	_, resp, err = dialWs(t, wsURL(base, "secret=s3cret"), http.Header{"Origin": {"https://evil.example"}})
-	require.Error(t, err)
-	require.Equal(t, http.StatusForbidden, resp.StatusCode)
-
-	w, _, err := dialWs(t, wsURL(base, "secret=s3cret"), http.Header{"Origin": {"https://good.example"}})
-	require.NoError(t, err)
-	r := w.call("eth_subscribe", `["newHeads"]`)
-	require.Nil(t, r.Error)
-
-	w2, _, err := dialWs(t, wsURL(base, ""), http.Header{"X-ERPC-Secret-Token": {"s3cret"}})
-	require.NoError(t, err)
-	require.Nil(t, w2.call("eth_subscribe", `["newHeads"]`).Error)
+	// A clean client close frame is recorded as reason=client.
+	require.Eventually(t, func() bool { return clientCloses()-closes0 >= 1 }, 5*time.Second, 20*time.Millisecond)
 }
 
 func TestWs_DisabledAndNoHeadCache(t *testing.T) {
