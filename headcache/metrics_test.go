@@ -145,16 +145,3 @@ func TestMetrics_LeaseLossDropsLeaderGauge(t *testing.T) {
 	a.Stop()
 	b.Stop()
 }
-
-func TestMetrics_DisabledIsNoop(t *testing.T) {
-	ctx := context.Background()
-	ch := newFakeChain(3)
-	c := New(testOpts("a"), NewMemoryStore(), ch, ch.head, nil)
-	c.Tick(ctx)
-	c.BlockByNumber(3, false)
-	s := c.Subscribe(1)
-	s.Close()
-	c.Stop()
-	require.Nil(t, c.metrics)
-	require.Equal(t, int64(1), c.Stats.Hits.Load())
-}

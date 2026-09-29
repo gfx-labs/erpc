@@ -269,10 +269,8 @@ func TestCache_SharedLeaderFollowerAndFencing(t *testing.T) {
 	require.Equal(t, int64(9), b.Head())
 	require.Equal(t, int64(1), b.Stats.LeaderEpochs.Load())
 
-	// Stale leader a cannot publish: its renew fails and it becomes follower.
-	stale := *a.lease
-	err := store.PublishSnapshot(ctx, &stale, &Snapshot{Epoch: stale.Epoch, Seq: 99, Head: 9, Hashes: []string{"0x1"}, At: time.Now()})
-	require.ErrorIs(t, err, ErrLeaseLost)
+	// Stale leader a: its renew fails and it becomes follower. Store-level
+	// fencing of stale publishes is owned by TestRedisStore_ExpiryStaleWriterRejected.
 	a.Tick(ctx)
 	require.Nil(t, a.lease)
 	require.Equal(t, int64(9), a.Head())
