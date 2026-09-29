@@ -1,19 +1,13 @@
 package telemetry
 
-import (
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"testing"
-
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-)
+import "testing"
 
 // Every family of the opt-in head cache and WebSocket features. Listed by
 // exposed name on purpose: KnownFamilies() only knows families declared through
 // Define*, so a family built with a raw prometheus constructor would silently
 // skip Configure (and every customization) without failing any generic test.
+// Real emission is owned by the feature tests (headcache TestMetrics_*, erpc
+// TestWs_*); this only guards registration.
 var featureFamilies = []string{
 	"erpc_head_cache_requests_total", "erpc_head_cache_fetches_total",
 	"erpc_head_cache_reorgs_total", "erpc_head_cache_snapshots_published_total",
@@ -52,42 +46,5 @@ func TestFeatureMetrics_ConfigureRegistration(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// Temporary: the WS counters have no lifecycle assertion yet, so their exposure
-// on a real scrape is only guarded here.
-func TestFeatureMetrics_WsSeriesScraped(t *testing.T) {
-	reg := withFreshRegistry(t)
-	if err := Configure(&Options{}); err != nil {
-		t.Fatal(err)
-	}
-	MetricWsConnections.WithLabelValues("p", "evm:1").Inc()
-	MetricWsSubscriptions.WithLabelValues("p", "evm:1", "newHeads").Inc()
-	CounterHandle(MetricWsNotificationsTotal, "p", "evm:1", "newHeads").Inc()
-	CounterHandle(MetricWsClosedTotal, "p", "evm:1", "client").Inc()
-	t.Cleanup(func() {
-		MetricWsConnections.Reset()
-		MetricWsSubscriptions.Reset()
-	})
-
-	srv := httptest.NewServer(promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-	defer srv.Close()
-	resp, err := http.Get(srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	body := string(b)
-	for _, l := range []string{
-		`erpc_ws_connections{network="evm:1",project="p"} 1`,
-		`erpc_ws_subscriptions{kind="newHeads",network="evm:1",project="p"} 1`,
-		`erpc_ws_notifications_total{kind="newHeads",network="evm:1",project="p"} 1`,
-		`erpc_ws_connections_closed_total{network="evm:1",project="p",reason="client"} 1`,
-	} {
-		if !strings.Contains(body, l+"\n") {
-			t.Errorf("scrape missing %q", l)
-		}
 	}
 }
