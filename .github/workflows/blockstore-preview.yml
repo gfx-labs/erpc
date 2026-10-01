@@ -1,0 +1,46 @@
+name: blockstore preview image
+
+on:
+  push:
+    branches: [feat/blockstore-ghcr-preview]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: blockstore-preview-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: github.repository == 'gfx-labs/erpc' && github.ref == 'refs/heads/feat/blockstore-ghcr-preview'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute image tags
+        id: image
+        run: echo "sha_tag=pr4-preview-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - name: Build and publish preview image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/gfx-labs/erpc:pr4-preview
+            ghcr.io/gfx-labs/erpc:${{ steps.image.outputs.sha_tag }}
+          build-args: |
+            VERSION=pr4-preview
+            COMMIT_SHA=${{ github.sha }}
