@@ -629,7 +629,7 @@ func TestHeadTracker_DerivedHashesOnlyBlockMatchesUpstream(t *testing.T) {
 	full["transactions"] = txs
 	hashOnly["transactions"] = hashes
 	for name, pair := range map[string][2]interface{}{
-		"three txs": {full, hashOnly},
+		"three txs":  {full, hashOnly},
 		"timedChain": {newTimedChain(time.Second, 1).block(1, true), newTimedChain(time.Second, 1).block(1, false)},
 	} {
 		fullRaw, _ := json.Marshal(pair[0])
