@@ -183,3 +183,27 @@ func EvmTrackedHeadFromContext(ctx context.Context) int64 {
 	}
 	return 0
 }
+
+// EvmProvenHeadNetwork is implemented by networks that can report the highest
+// head an eligible upstream has PROVEN (its own known head: state poller value
+// plus any SuggestLatestBlock), excluding one upstream and any upstream that
+// already failed the request bound to ctx.
+type EvmProvenHeadNetwork interface {
+	EvmProvenHead(ctx context.Context, exclude Upstream) int64
+}
+
+// EvmProvenHeadFromContext returns EvmProvenHead for the network of the
+// request bound to ctx, or 0 when unavailable.
+func EvmProvenHeadFromContext(ctx context.Context, exclude Upstream) int64 {
+	if ctx == nil {
+		return 0
+	}
+	req, ok := ctx.Value(RequestContextKey).(*NormalizedRequest)
+	if !ok || req == nil {
+		return 0
+	}
+	if n, ok := req.Network().(EvmProvenHeadNetwork); ok {
+		return n.EvmProvenHead(ctx, exclude)
+	}
+	return 0
+}

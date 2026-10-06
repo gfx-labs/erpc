@@ -546,6 +546,16 @@ func (t *headTracker) recoverFromPoisonedHead(ctx context.Context, obs *headObse
 	if t.regressStreak < headTrackerRecoverAfter {
 		return false
 	}
+	// A STUCK node on the right chain also polls consistently far below the
+	// published head. Only a head that is current (its block timestamp
+	// within max(5 block times, 60s) of now) can be the chain's real tip.
+	if obs.Timestamp <= 0 {
+		return false
+	}
+	recent := max(5*t.blockTime(), time.Minute)
+	if age := t.deps.now().Sub(time.Unix(obs.Timestamp, 0)); age > recent || age < -headTrackerFutureSlack {
+		return false
+	}
 	if !t.chainIdOk(ctx, obs) {
 		return false
 	}

@@ -273,6 +273,28 @@ func TestHeadTracker_BogusFirstHeadAndRecovery(t *testing.T) {
 	require.Equal(t, n, ht.Head(), "consistent polls recover from the poisoned head")
 }
 
+// NEW-2: a stuck node on the right chain, far (>1024 blocks) behind the real
+// head, polls consistently and passes the chain-id check. Its old block
+// timestamp must prevent it from rolling the published head back.
+func TestHeadTracker_StuckNodeDoesNotTriggerRollback(t *testing.T) {
+	ssr := newTestSSR(t, t.Context())
+	up := common.NewFakeUpstream("u1")
+	stuckTs := time.Now().Add(-2 * time.Hour).Unix()
+	ht := newTestTracker(ssr, nil, headTrackerDeps{
+		blockTime: func() time.Duration { return time.Second },
+		poll: func(context.Context, bool) (*headObservation, error) {
+			return &headObservation{Number: 1000, Upstream: up, Timestamp: stuckTs}, nil
+		},
+		verifyChainId: func(context.Context, common.Upstream) (bool, error) { return true, nil },
+	})
+	ht.leaseDeadlineNs.Store(time.Now().Add(time.Hour).UnixNano())
+	ht.head.TryUpdate(t.Context(), 1000+common.DefaultToleratedBlockHeadRollback+500)
+	for i := 0; i < 3*headTrackerRecoverAfter; i++ {
+		_, _ = ht.tick(t.Context())
+	}
+	require.Equal(t, int64(1000+common.DefaultToleratedBlockHeadRollback+500), ht.Head(), "no rollback to a stale head")
+}
+
 // S4: a leader past its hard lease deadline never publishes.
 func TestHeadTracker_NoPublishPastLeaseDeadline(t *testing.T) {
 	ssr := newTestSSR(t, t.Context())

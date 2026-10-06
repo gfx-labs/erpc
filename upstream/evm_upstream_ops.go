@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"time"
 
 	"github.com/erpc/erpc/common"
 	"github.com/erpc/erpc/telemetry"
@@ -137,12 +138,15 @@ func (u *Upstream) EvmAssertBlockAvailability(ctx context.Context, forMethod str
 	// Resolve configured availability bounds (min/max) and enforce before legacy logic
 	minBound, maxBound := u.resolveAvailabilityBounds()
 	// Head tracker: a latestBlockMinus upper bound is derived from this
-	// upstream's slow poller head; re-derive it from the fresh tracked head
-	// (see the head-tracker note in the block-head case below).
+	// upstream's slow poller head. Re-derive it from the tracked head only
+	// when this upstream's own known head is within the same proximity the
+	// block-head gate below uses (it then plausibly has the block): range
+	// methods answer [] for a missing block, so optimism must be earned.
 	if maxBound != math.MaxInt64 && blockNumber > maxBound && cfg.Evm.BlockAvailability != nil {
 		if up := cfg.Evm.BlockAvailability.Upper; up != nil && up.ExactBlock == nil && up.LatestBlockMinus != nil {
-			if tracked := common.EvmTrackedHeadFromContext(ctx); tracked > 0 && tracked-*up.LatestBlockMinus > maxBound {
-				maxBound = tracked - *up.LatestBlockMinus
+			if tracked := common.EvmTrackedHeadFromContext(ctx); tracked > 0 && blockNumber <= tracked-*up.LatestBlockMinus &&
+				blockNumber+*up.LatestBlockMinus <= statePoller.LatestBlock()+u.trackerProximity(cfg.Evm.HeadLagToleranceBlocks) {
+				maxBound = blockNumber
 			}
 		}
 	}
@@ -229,18 +233,32 @@ func (u *Upstream) EvmAssertBlockAvailability(ctx context.Context, forMethod str
 		// block internally. The gate then only reroutes requests pinned
 		// beyond head+tolerance.
 		tolerance := cfg.Evm.HeadLagToleranceBlocks
-		// Fleet head tracker: a block at or below the network's fresh tracker
-		// head has been observed through normal routing, so it exists. Treat
-		// it as servable (optimistically, like venn) instead of force-polling
-		// this upstream's head per request: with slow state pollers the
-		// tracker head is ahead of every upstream's known head, and a
-		// per-request poll would bring back per-upstream per-block polling. An
-		// upstream that really lacks the block answers empty or with an
-		// error, and the network's missing-data retry and failover move the
-		// request to another upstream. Configured availability bounds were
-		// already enforced above.
+		// Fleet head tracker. The tracker head (a block observed through
+		// normal routing) runs ahead of every slow per-upstream poller, so a
+		// per-request force-poll here would bring back per-upstream
+		// per-block polling. But this gate guards RANGE methods (eth_getLogs,
+		// trace_filter), where an upstream that lacks the block answers []
+		// rather than an error: being optimistic about such an upstream
+		// would serve an empty result as data. So:
+		//   - if this upstream's OWN known head (poller value plus
+		//     SuggestLatestBlock advances) is within proximity of the block,
+		//     it is treated as able to serve it;
+		//   - otherwise, if another eligible upstream has proven the height,
+		//     this one is skipped as not-yet-available WITHOUT polling, and
+		//     selection moves to an upstream that proved it;
+		//   - only when no upstream has proven it does the old path run:
+		//     one debounced force-poll of this upstream.
+		// Proximity is max(tolerance, 2 blocks, 2 seconds of blocks): the
+		// cadence at which response enrichment keeps a serving upstream's
+		// known head current.
 		if tracked := common.EvmTrackedHeadFromContext(ctx); tracked > 0 && blockNumber <= tracked+tolerance && blockNumber > latestBlock+tolerance {
-			latestBlock = tracked
+			proximity := u.trackerProximity(tolerance)
+			switch {
+			case blockNumber <= latestBlock+proximity:
+				latestBlock = blockNumber
+			case common.EvmProvenHeadFromContext(ctx, u) >= blockNumber:
+				forceFreshIfStale = false
+			}
 		}
 		// If the requested block is beyond the current latest block (plus
 		// tolerance), try force-polling once
@@ -285,4 +303,23 @@ func (u *Upstream) EvmAssertBlockAvailability(ctx context.Context, forMethod str
 	default:
 		return false, fmt.Errorf("unsupported block availability confidence: %s", confidence)
 	}
+}
+
+// trackerBlockTime is the network's measured block time, or 0.
+func (u *Upstream) trackerBlockTime() time.Duration {
+	if u.metricsTracker == nil {
+		return 0
+	}
+	return u.metricsTracker.GetNetworkBlockTime(u.NetworkId())
+}
+
+// trackerProximity is how far below a block this upstream's own known head
+// may be while it is still trusted to serve that block under the head
+// tracker: max(headLagToleranceBlocks, 2 blocks, 2 seconds of blocks).
+func (u *Upstream) trackerProximity(tolerance int64) int64 {
+	p := max(tolerance, 2)
+	if bt := u.trackerBlockTime(); bt > 0 {
+		p = max(p, int64(2*time.Second/bt))
+	}
+	return p
 }

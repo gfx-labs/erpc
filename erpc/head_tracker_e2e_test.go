@@ -49,6 +49,18 @@ type timedChain struct {
 	// pinned, when > 0, freezes the chain at that height (deterministic
 	// assertions on one head block).
 	pinned atomic.Int64
+	// errorBeyondHead makes eth_getLogs past this node's head an error
+	// instead of a silently short result.
+	errorBeyondHead atomic.Bool
+}
+
+func (c *timedChain) resolveTag(ref string) int64 {
+	switch ref {
+	case "latest", "", "<nil>":
+		return c.head()
+	}
+	n, _ := strconv.ParseInt(strings.TrimPrefix(ref, "0x"), 16, 64)
+	return n
 }
 
 func newTimedChain(blockTime time.Duration, base int64) *timedChain {
@@ -159,14 +171,25 @@ func (c *timedChain) serve(w http.ResponseWriter, r *http.Request) {
 	case "eth_getLogs":
 		var flt map[string]interface{}
 		_ = json.Unmarshal(req.Params[0], &flt)
-		to, _ := flt["toBlock"].(string)
-		if strings.HasPrefix(to, "0x") {
-			if n, err := strconv.ParseInt(to[2:], 16, 64); err == nil && n > c.head() {
-				rpcErr = map[string]interface{}{"code": -32000, "message": "block range extends beyond current head block"}
-				break
-			}
+		from := c.resolveTag(fmt.Sprint(flt["fromBlock"]))
+		to := c.resolveTag(fmt.Sprint(flt["toBlock"]))
+		if c.errorBeyondHead.Load() && to > c.head() {
+			rpcErr = map[string]interface{}{"code": -32000, "message": "block range extends beyond current head block"}
+			break
 		}
-		result = []interface{}{}
+		// Like most nodes, a block this node has not seen yet silently
+		// contributes no logs: every block has exactly one log, so an empty
+		// or short result for a range at the head is WRONG data.
+		logs := []interface{}{}
+		for n := from; n <= to && n <= c.head(); n++ {
+			logs = append(logs, map[string]interface{}{
+				"address": "0x0000000000000000000000000000000000000002", "topics": []string{},
+				"data": "0x", "blockNumber": fmt.Sprintf("0x%x", n), "blockHash": timedHash(n),
+				"transactionHash": fmt.Sprintf("0x%064x", n+1<<40), "transactionIndex": "0x0",
+				"logIndex": "0x0", "removed": false,
+			})
+		}
+		result = logs
 	case "eth_getBlockByNumber", "eth_getBlockByHash":
 		var ref string
 		var full bool
@@ -505,30 +528,26 @@ func TestHeadTracker_E2E_PremiumPassthroughWhileDisabled(t *testing.T) {
 	require.Greater(t, n, stale, "latest block is live, not the stale poller head")
 }
 
-// Regression (review blocker): with the tracker on, "latest" interpolates to
-// the tracker head, which is ahead of every upstream's 60s poller view. The
-// block-availability gates must then NOT force-poll each upstream's head per
-// request (that brings back per-upstream per-block polling). 3 replicas × 3
-// upstreams, 1s blocks, a steady stream of eth_getLogs(toBlock=latest),
-// eth_call(latest) and getBlockByNumber(latest): total upstream
-// latest/blockNumber polls stay ≈ 1 per block (the leader only) plus the
-// pollers' own ticks. One upstream lags two blocks and answers null/errors
-// for the head: requests still succeed by failing over.
-func TestHeadTracker_E2E_NoPerUpstreamPollingUnderLatestTraffic(t *testing.T) {
+// latestTrafficScenario runs 3 replicas x 3 upstreams on a 1s chain and a
+// steady stream of eth_getLogs(latest), eth_call(latest) and
+// getBlockByNumber(latest) for `blocks` blocks. setup configures the three
+// upstream nodes and their configs. It returns per-upstream head polls
+// (getBlockByNumber(latest) + eth_blockNumber), failures, and wrong getLogs
+// results (a range at the head must contain one log per block).
+type trafficResult struct {
+	reqs, fails, wrongLogs int
+	polls                  [3]int64
+}
+
+func runLatestTraffic(t *testing.T, blocks int, setup func(ups []*timedChain, cfgs []*common.UpstreamConfig)) trafficResult {
 	mr := miniredis.RunT(t)
 	chain := newTimedChain(time.Second, 20_000)
 	defer chain.Close()
 	ups := []*timedChain{chain, chain.view(), chain.view()}
 	defer ups[1].Close()
 	defer ups[2].Close()
-	// u0 (first in order) answers the leader's latest polls, so its known
-	// head stays current through response enrichment. Make it fail data
-	// methods so that traffic lands on u1/u2, whose 60s poller views are
-	// stale: exactly the upstreams the availability gate used to force-poll.
-	ups[0].failData.Store(true)
-	ups[2].lagBlocks.Store(2)
 
-	cluster := fmt.Sprintf("ht-nopoll-%d", time.Now().UnixNano())
+	cluster := fmt.Sprintf("ht-traffic-%d", time.Now().UnixNano())
 	mk := func() *common.Config {
 		cfg := headTrackerTestConfig(mr.Addr(), cluster, chain.URL(),
 			&common.EvmHeadTrackerConfig{Enabled: true, LeaseTtl: common.Duration(2 * time.Second)}, false)
@@ -541,20 +560,15 @@ func TestHeadTracker_E2E_NoPerUpstreamPollingUnderLatestTraffic(t *testing.T) {
 			c.Evm = &evmCfg
 			c.Id = fmt.Sprintf("u%d", i)
 			c.Endpoint = u.URL()
-			if i == 1 {
-				// A head-relative serving range: the network-level gate
-				// (checkUpstreamBlockAvailability) used to skip this upstream
-				// for every tracked block and fire handleBlockSkip's poll.
-				zero := int64(0)
-				evmCfg.BlockAvailability = &common.EvmBlockAvailabilityConfig{
-					Upper: &common.EvmAvailabilityBoundConfig{LatestBlockMinus: &zero},
-				}
-			}
 			prj.Upstreams = append(prj.Upstreams, &c)
 		}
+		setup(ups, prj.Upstreams)
 		return cfg
 	}
 	reps := startHTReplicas(t, 3, mk)
+	for _, r := range reps {
+		r.network(t).PinUpstreamOrderForTest("u0", "u1", "u2")
+	}
 	require.Eventually(t, func() bool {
 		for _, r := range reps {
 			if trackerOf(t, r).FreshHead() < chain.head()-1 {
@@ -564,43 +578,93 @@ func TestHeadTracker_E2E_NoPerUpstreamPollingUnderLatestTraffic(t *testing.T) {
 		return true
 	}, 15*time.Second, 50*time.Millisecond)
 
-	headPolls := func() int64 {
-		var n int64
-		for _, u := range ups {
-			n += u.latestCalls.Load() + int64(u.Calls("eth_blockNumber"))
-		}
-		return n
+	var res trafficResult
+	var start [3]int64
+	for i, u := range ups {
+		start[i] = u.latestCalls.Load() + int64(u.Calls("eth_blockNumber"))
 	}
-	start := headPolls()
-	const blocks = 30
-	deadline := time.Now().Add(blocks * chain.blockTime)
-	var reqs, fails int
+	deadline := time.Now().Add(time.Duration(blocks) * chain.blockTime)
 	for time.Now().Before(deadline) {
 		for _, r := range reps {
+			head := trackerOf(t, r).FreshHead()
 			for _, q := range []struct{ m, p string }{
-				{"eth_getLogs", `[{"fromBlock":"latest","toBlock":"latest"}]`},
+				{"eth_getLogs", fmt.Sprintf(`[{"fromBlock":"0x%x","toBlock":"latest"}]`, head-2)},
 				{"eth_call", `[{"to":"0x0000000000000000000000000000000000000002","data":"0x"},"latest"]`},
 				{"eth_getBlockByNumber", `["latest",false]`},
 			} {
-				reqs++
+				res.reqs++
 				code, _, body := r.send(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":%q,"params":%s}`, q.m, q.p), nil, nil)
 				var resp rpcResp
 				_ = json.Unmarshal([]byte(body), &resp)
 				if code != 200 || len(resp.Error) > 0 || string(resp.Result) == "null" {
-					fails++
-					t.Logf("%s failed: %d %s", q.m, code, body)
+					res.fails++
+					continue
+				}
+				if q.m == "eth_getLogs" {
+					var logs []struct{ BlockNumber string }
+					_ = json.Unmarshal(resp.Result, &logs)
+					// fromBlock..latest where latest >= head: at least 3 logs.
+					if len(logs) < 3 {
+						res.wrongLogs++
+						t.Logf("wrong getLogs result (%d logs) for range from 0x%x", len(logs), head-2)
+					}
 				}
 			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	polls := headPolls() - start
-	t.Logf("%d requests over %d blocks: %d upstream latest/blockNumber polls (%.2f per block), %d failures",
-		reqs, blocks, polls, float64(polls)/blocks, fails)
-	require.Zero(t, fails, "requests succeed even though one upstream lags the head")
-	// Leader: ~1/block. Slack for a stale retry or two and the 60s pollers'
-	// ticks (3 upstreams × 3 replicas, at most one tick each in the window).
-	require.LessOrEqual(t, float64(polls), blocks*1.3+9, "no per-upstream per-request head polling")
+	for i, u := range ups {
+		res.polls[i] = u.latestCalls.Load() + int64(u.Calls("eth_blockNumber")) - start[i]
+	}
+	t.Logf("%d requests over %d blocks: head polls per upstream %v (total %.2f per block), %d failures, %d wrong getLogs",
+		res.reqs, blocks, res.polls, float64(res.polls[0]+res.polls[1]+res.polls[2])/float64(blocks), res.fails, res.wrongLogs)
+	return res
+}
+
+// Regression (review B1 + NEW-1): with the tracker on, "latest" resolves to
+// the tracker head, ahead of every upstream's 60s poller view.
+//   - Total head polls stay ~1 per block (the leader) instead of per
+//     upstream per replica per block.
+//   - A lagging upstream that NEVER serves successfully (so no response ever
+//     advances its known head) is never force-polled and never answers a
+//     getLogs at the head with its silently short result.
+//   - u1 has a head-relative serving range (latestBlockMinus: 0).
+func TestHeadTracker_E2E_NoPerUpstreamPollingUnderLatestTraffic(t *testing.T) {
+	res := runLatestTraffic(t, 30, func(ups []*timedChain, cfgs []*common.UpstreamConfig) {
+		// u0 answers the leader's polls (its known head stays current via
+		// enrichment) but fails data methods, so data traffic reaches u1/u2,
+		// whose 60s poller views are stale.
+		ups[0].failData.Store(true)
+		zero := int64(0)
+		cfgs[1].Evm.BlockAvailability = &common.EvmBlockAvailabilityConfig{
+			Upper: &common.EvmAvailabilityBoundConfig{LatestBlockMinus: &zero},
+		}
+		// u2 lags 3 blocks and fails every data method, so it NEVER serves
+		// successfully and no response ever advances its known head: only
+		// the gates themselves can keep it from being force-polled.
+		ups[2].lagBlocks.Store(3)
+		ups[2].failData.Store(true)
+	})
+	require.Zero(t, res.fails, "requests succeed")
+	require.Zero(t, res.wrongLogs, "no short/empty getLogs result is served for a range at the head")
+	require.LessOrEqual(t, res.polls[2], int64(3), "the never-serving lagging upstream is not force-polled (at most its own 60s ticks)")
+	total := res.polls[0] + res.polls[1] + res.polls[2]
+	// Leader ~1/block (it may land on any upstream with the policy order);
+	// slack for the 60s pollers' ticks (one per upstream per replica).
+	require.LessOrEqual(t, float64(total), 30*1.3+9, "no per-upstream per-request head polling")
+}
+
+// NEW-1: the only upstreams with a proven head are failing, and a lagging
+// upstream returns [] for getLogs at the head. Its short result must never be
+// served: with nothing else proven, it is force-polled (debounced) and
+// correctly judged behind, so the request waits/retries instead.
+func TestHeadTracker_E2E_LaggingUpstreamEmptyLogsNotServed(t *testing.T) {
+	res := runLatestTraffic(t, 10, func(ups []*timedChain, cfgs []*common.UpstreamConfig) {
+		ups[0].failData.Store(true)
+		ups[1].lagBlocks.Store(5)
+		ups[2].lagBlocks.Store(5)
+	})
+	require.Zero(t, res.wrongLogs, "a lagging upstream's short getLogs result is never served")
 }
 
 // The hashes-only block derived from a fullBlocks poll must equal what an

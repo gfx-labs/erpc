@@ -288,3 +288,39 @@ func configuredUpperLatestBlockMinus(u common.Upstream) *int64 {
 	}
 	return up.LatestBlockMinus
 }
+
+// EvmProvenHead implements common.EvmProvenHeadNetwork: the highest known
+// head (state poller value, including SuggestLatestBlock advances) among the
+// network's eligible upstreams, plus each one's declared head-lag tolerance,
+// excluding `exclude` and every upstream that already failed the request
+// bound to ctx. The upstream that served the leader's poll is in this set
+// (response enrichment advanced its head), so it is normally the tracker
+// head itself.
+func (n *Network) EvmProvenHead(ctx context.Context, exclude common.Upstream) int64 {
+	req, _ := ctx.Value(common.RequestContextKey).(*common.NormalizedRequest)
+	var best int64
+	for _, u := range n.tipCandidateUpstreams(ctx, "*") {
+		if exclude != nil && u.Id() == exclude.Id() {
+			continue
+		}
+		if req != nil {
+			if _, failed := req.ErrorsByUpstream.Load(u); failed {
+				continue
+			}
+		}
+		eu, ok := u.(common.EvmUpstream)
+		if !ok {
+			continue
+		}
+		sp := eu.EvmStatePoller()
+		if sp == nil || sp.IsObjectNull() || eu.EvmSyncingState() == common.EvmSyncingStateSyncing {
+			continue
+		}
+		h := sp.LatestBlock()
+		if cfg := u.Config(); cfg != nil && cfg.Evm != nil {
+			h += cfg.Evm.HeadLagToleranceBlocks
+		}
+		best = max(best, h)
+	}
+	return best
+}
