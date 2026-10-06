@@ -644,10 +644,18 @@ type header struct {
 
 // parseHeader validates a hash-only block header at height n.
 func parseHeader(raw json.RawMessage, n int64) (*header, error) {
-	b, got, err := parseBlockHeader(raw)
+	// Parse the kept copy so the header references only its own bytes.
+	raw = append(json.RawMessage(nil), raw...)
+	sb, got, err := parseScannedBlock(raw)
 	if err != nil {
 		return nil, err
 	}
+	return headerFromScan(sb.b, raw, got, n)
+}
+
+// headerFromScan finishes parseHeader for a parsed hash-only block whose
+// bytes (raw) the header keeps.
+func headerFromScan(b *rawBlock, raw json.RawMessage, got, n int64) (*header, error) {
 	if got != n {
 		return nil, fmt.Errorf("returned block %d", got)
 	}
@@ -659,7 +667,7 @@ func parseHeader(raw json.RawMessage, n int64) (*header, error) {
 		return nil, errors.New("header carries full transactions")
 	}
 	b.Hash, b.ParentHash = normHash(b.Hash), normHash(b.ParentHash)
-	return &header{raw: append(json.RawMessage(nil), raw...), b: b, n: n}, nil
+	return &header{raw: raw, b: b, n: n}, nil
 }
 
 func (c *Cache) getHeader(ctx context.Context, n int64, reason string) (*header, error) {

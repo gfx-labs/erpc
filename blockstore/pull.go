@@ -573,21 +573,29 @@ func (c *Cache) AdoptBlock(ctx context.Context, raw json.RawMessage, full, canon
 		return
 	}
 	c.adoptParses.Add(1)
-	b, n, err := parseBlockHeader(raw)
+	sb, n, err := parseScannedBlock(raw)
 	if err != nil {
 		return
 	}
+	b := sb.b
 	_, isFull, err := txHashesOf(b)
 	if err != nil || isFull != full && len(b.Transactions) > 0 {
 		return
 	}
-	hraw := raw
+	// The header is derived from the same scan: the hashes-only form is
+	// spliced from raw, so the block is not decoded again.
+	var h *header
 	if isFull && len(b.Transactions) > 0 {
-		if hraw, err = hashOnlyHeader(raw); err != nil {
-			return
+		if hraw, hb, ok := sb.hashesOnly(); ok {
+			h, err = headerFromScan(hb, hraw, n, n)
+		} else if hraw, herr := hashOnlyHeader(raw); herr == nil {
+			h, err = parseHeader(hraw, n)
+		} else {
+			err = herr
 		}
+	} else {
+		h, err = parseHeader(raw, n)
 	}
-	h, err := parseHeader(hraw, n)
 	if err != nil {
 		return
 	}
