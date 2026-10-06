@@ -1,4 +1,4 @@
-package integrity
+package legacy
 
 import (
 	"context"
@@ -22,12 +22,7 @@ func init() {
 			case MethodGetBlockReceipts:
 				target = &[]Receipt{}
 			case MethodGetBlockByNumber, MethodGetBlockByHash:
-				// The shared header decode is this exact decode; reuse its
-				// verdict instead of parsing the block again.
-				if d.Header(); d.headerErr != nil {
-					return failf("malformed result for %s: %v", d.method, d.headerErr)
-				}
-				return nil
+				target = &Header{}
 			default:
 				return nil
 			}
