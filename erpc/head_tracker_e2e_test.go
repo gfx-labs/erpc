@@ -19,8 +19,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-
-
 // timedChain is a JSON-RPC EVM node whose head advances on the wall clock
 // (one block per blockTime) with real unix timestamps, so the head tracker's
 // block-time alignment is exercised as on a live chain. It counts calls per
