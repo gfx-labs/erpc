@@ -154,6 +154,8 @@ type Cache struct {
 	presence    PresenceStore
 	// following is whether the last tick followed headers.
 	following bool
+	// adoptParses counts AdoptBlock calls that took the full parse (tests).
+	adoptParses atomic.Int64
 }
 
 // maxLeaderFailures is how many consecutive failed leader ticks are tolerated
