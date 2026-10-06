@@ -136,6 +136,16 @@ func (u *Upstream) EvmAssertBlockAvailability(ctx context.Context, forMethod str
 
 	// Resolve configured availability bounds (min/max) and enforce before legacy logic
 	minBound, maxBound := u.resolveAvailabilityBounds()
+	// Head tracker: a latestBlockMinus upper bound is derived from this
+	// upstream's slow poller head; re-derive it from the fresh tracked head
+	// (see the head-tracker note in the block-head case below).
+	if maxBound != math.MaxInt64 && blockNumber > maxBound && cfg.Evm.BlockAvailability != nil {
+		if up := cfg.Evm.BlockAvailability.Upper; up != nil && up.ExactBlock == nil && up.LatestBlockMinus != nil {
+			if tracked := common.EvmTrackedHeadFromContext(ctx); tracked > 0 && tracked-*up.LatestBlockMinus > maxBound {
+				maxBound = tracked - *up.LatestBlockMinus
+			}
+		}
+	}
 	if minBound != math.MinInt64 && blockNumber < minBound {
 		telemetry.MetricUpstreamStaleLowerBound.WithLabelValues(
 			u.ProjectId,

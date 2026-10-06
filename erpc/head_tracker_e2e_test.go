@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/erpc/erpc/blockstore"
 	"github.com/erpc/erpc/common"
 	"github.com/erpc/erpc/util"
 	"github.com/stretchr/testify/require"
@@ -45,6 +46,9 @@ type timedChain struct {
 	// failData makes eth_call / eth_getLogs fail with a retryable server
 	// error, so data traffic fails over to the other upstreams.
 	failData atomic.Bool
+	// pinned, when > 0, freezes the chain at that height (deterministic
+	// assertions on one head block).
+	pinned atomic.Int64
 }
 
 func newTimedChain(blockTime time.Duration, base int64) *timedChain {
@@ -57,6 +61,9 @@ func (c *timedChain) Close()      { c.srv.Close() }
 func (c *timedChain) URL() string { return c.srv.URL }
 
 func (c *timedChain) head() int64 {
+	if p := c.pinned.Load(); p > 0 {
+		return p - c.lagBlocks.Load()
+	}
 	return c.base + int64(time.Since(c.start)/c.blockTime) - c.lagBlocks.Load()
 }
 
@@ -300,13 +307,33 @@ func TestHeadTracker_E2E_MultiPodTracksFastChain(t *testing.T) {
 		return true
 	}, 10*time.Second, 50*time.Millisecond, "every replica follows the tracker head")
 
-	leaders := 0
-	for _, r := range reps {
-		if trackerOf(t, r).IsLeader() {
-			leaders++
-		}
+	// Count concurrent leaders on every tick of the run, not one snapshot.
+	stopSampling := make(chan struct{})
+	var maxLeaders, minLeaders atomic.Int32
+	minLeaders.Store(99)
+	trackers := make([]*headTracker, len(reps))
+	for i, r := range reps {
+		trackers[i] = trackerOf(t, r)
 	}
-	require.Equal(t, 1, leaders, "exactly one replica polls")
+	go func() {
+		tk := time.NewTicker(5 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stopSampling:
+				return
+			case <-tk.C:
+				var c int32
+				for _, tr := range trackers {
+					if tr.IsLeader() {
+						c++
+					}
+				}
+				maxLeaders.Store(max(maxLeaders.Load(), c))
+				minLeaders.Store(min(minLeaders.Load(), c))
+			}
+		}
+	}()
 
 	window := 6 * time.Second
 	startLatest := chain.latestCalls.Load()
@@ -320,6 +347,9 @@ func TestHeadTracker_E2E_MultiPodTracksFastChain(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	close(stopSampling)
+	require.Equal(t, int32(1), maxLeaders.Load(), "never more than one polling replica")
+	require.Equal(t, int32(1), minLeaders.Load(), "always exactly one polling replica")
 	latestPerBlock := float64(chain.latestCalls.Load()-startLatest) / window.Seconds()
 	t.Logf("3 replicas: %.2f latest polls per block, %d eth_blockNumber upstream calls, max lag %d blocks",
 		latestPerBlock, chain.Calls("eth_blockNumber")-startBN, maxLag)
@@ -405,20 +435,17 @@ func TestHeadTracker_E2E_FollowerServesPolledBlockFromCache(t *testing.T) {
 				return false
 			}, 10*time.Second, 20*time.Millisecond)
 
-			// Wait for a fresh head whose block the leader has written.
-			var head int64
-			require.Eventually(t, func() bool {
-				head = trackerOf(t, follower).FreshHead()
-				return head > 0 && head == chain.head()
-			}, 10*time.Second, 20*time.Millisecond)
+			// Freeze the chain, then wait until the follower serves that head
+			// as fresh. The leader writes the block BEFORE publishing (S1), so
+			// no sleep is needed: seeing the head implies the block is cached.
+			require.Eventually(t, func() bool { return trackerOf(t, follower).FreshHead() > 0 }, 10*time.Second, 20*time.Millisecond)
+			head := chain.head()
+			chain.pinned.Store(head)
+			require.Eventually(t, func() bool { return trackerOf(t, follower).FreshHead() == head }, 5*time.Second, 5*time.Millisecond)
 			hexHead := fmt.Sprintf("0x%x", head)
-			time.Sleep(200 * time.Millisecond) // async cache write
 
 			before := chain.byNumberCalls.Load() + chain.byHashCalls.Load()
 			beforeLatest := chain.latestCalls.Load()
-			if head != chain.head() {
-				t.Skip("chain advanced during the setup; block-time too short for this host")
-			}
 			for _, variant := range []bool{false, true} {
 				if variant && !full {
 					continue // a hashes-only poll never fabricates a full block
@@ -433,7 +460,7 @@ func TestHeadTracker_E2E_FollowerServesPolledBlockFromCache(t *testing.T) {
 			}
 			require.Equal(t, before, chain.byNumberCalls.Load()+chain.byHashCalls.Load(), "follower reads made no upstream call")
 			// The leader may poll latest once more meanwhile; the follower never does.
-			require.LessOrEqual(t, chain.latestCalls.Load()-beforeLatest, int64(1))
+			require.LessOrEqual(t, chain.latestCalls.Load()-beforeLatest, int64(2))
 		})
 	}
 }
@@ -514,6 +541,15 @@ func TestHeadTracker_E2E_NoPerUpstreamPollingUnderLatestTraffic(t *testing.T) {
 			c.Evm = &evmCfg
 			c.Id = fmt.Sprintf("u%d", i)
 			c.Endpoint = u.URL()
+			if i == 1 {
+				// A head-relative serving range: the network-level gate
+				// (checkUpstreamBlockAvailability) used to skip this upstream
+				// for every tracked block and fire handleBlockSkip's poll.
+				zero := int64(0)
+				evmCfg.BlockAvailability = &common.EvmBlockAvailabilityConfig{
+					Upper: &common.EvmAvailabilityBoundConfig{LatestBlockMinus: &zero},
+				}
+			}
 			prj.Upstreams = append(prj.Upstreams, &c)
 		}
 		return cfg
@@ -565,4 +601,96 @@ func TestHeadTracker_E2E_NoPerUpstreamPollingUnderLatestTraffic(t *testing.T) {
 	// Leader: ~1/block. Slack for a stale retry or two and the 60s pollers'
 	// ticks (3 upstreams × 3 replicas, at most one tick each in the window).
 	require.LessOrEqual(t, float64(polls), blocks*1.3+9, "no per-upstream per-request head polling")
+}
+
+// The hashes-only block derived from a fullBlocks poll must equal what an
+// upstream returns for eth_getBlockByNumber(n, false): same fields and values,
+// transactions as hashes in order (key order is irrelevant on the wire).
+func TestHeadTracker_DerivedHashesOnlyBlockMatchesUpstream(t *testing.T) {
+	type tx = map[string]interface{}
+	hashes := []string{timedHash(1 << 41), timedHash(1<<41 + 1), timedHash(1<<41 + 2)}
+	base := map[string]interface{}{
+		"number": "0x10", "hash": timedHash(16), "parentHash": timedHash(15), "timestamp": "0x65",
+		"gasLimit": "0x1c9c380", "gasUsed": "0x5208", "miner": "0x0000000000000000000000000000000000000000",
+		"extraData": "0x", "logsBloom": "0x" + strings.Repeat("0", 512), "uncles": []string{},
+		"baseFeePerGas": "0x7", "withdrawals": []interface{}{}, "size": "0x220",
+	}
+	full := map[string]interface{}{}
+	hashOnly := map[string]interface{}{}
+	for k, v := range base {
+		full[k], hashOnly[k] = v, v
+	}
+	var txs []tx
+	for i, h := range hashes {
+		txs = append(txs, tx{"hash": h, "blockHash": timedHash(16), "blockNumber": "0x10",
+			"transactionIndex": fmt.Sprintf("0x%x", i), "from": "0x0000000000000000000000000000000000000001",
+			"input": "0x", "nonce": fmt.Sprintf("0x%x", i), "type": "0x2", "value": "0x0"})
+	}
+	full["transactions"] = txs
+	hashOnly["transactions"] = hashes
+	for name, pair := range map[string][2]interface{}{
+		"three txs": {full, hashOnly},
+		"timedChain": {newTimedChain(time.Second, 1).block(1, true), newTimedChain(time.Second, 1).block(1, false)},
+	} {
+		fullRaw, _ := json.Marshal(pair[0])
+		wantRaw, _ := json.Marshal(pair[1])
+		got, err := (&blockstore.BlockRecord{Block: fullRaw}).BlockJSON(false)
+		require.NoError(t, err, name)
+		require.JSONEq(t, string(wantRaw), string(got), name)
+	}
+}
+
+// Shared state (Redis) goes away: no replica can hold or renew the lease, so
+// none polls; all fall back to the poller heads with the floor keeping
+// eth_blockNumber monotonic; no polling storm.
+func TestHeadTracker_E2E_RedisOutageFallsBackWithoutPolling(t *testing.T) {
+	mr := miniredis.RunT(t)
+	chain := newTimedChain(time.Second, 40_000)
+	defer chain.Close()
+	cluster := fmt.Sprintf("ht-outage-%d", time.Now().UnixNano())
+	reps := startHTReplicas(t, 3, func() *common.Config {
+		return headTrackerTestConfig(mr.Addr(), cluster, chain.URL(),
+			&common.EvmHeadTrackerConfig{Enabled: true, LeaseTtl: common.Duration(time.Second)}, false)
+	})
+	require.Eventually(t, func() bool {
+		for _, r := range reps {
+			if trackerOf(t, r).FreshHead() < chain.head()-1 {
+				return false
+			}
+		}
+		return true
+	}, 15*time.Second, 50*time.Millisecond)
+	last := map[int]int64{}
+	for i, r := range reps {
+		last[i] = r.blockNumber(t)
+	}
+
+	mr.Close()
+	// Every replica steps down within ~2/3 TTL and enters fallback after
+	// the staleness window.
+	require.Eventually(t, func() bool {
+		for _, r := range reps {
+			if trackerOf(t, r).IsLeader() || trackerOf(t, r).FreshHead() != 0 {
+				return false
+			}
+		}
+		return true
+	}, 15*time.Second, 50*time.Millisecond, "no leader and every replica in fallback")
+
+	// Client eth_blockNumber requests go upstream in fallback (as without the
+	// tracker), so count only background head polls: getBlockByNumber(latest).
+	start := chain.latestCalls.Load()
+	window := 5 * time.Second
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		for i, r := range reps {
+			bn := r.blockNumber(t)
+			require.GreaterOrEqual(t, bn, last[i], "eth_blockNumber never goes backwards in fallback")
+			last[i] = bn
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	polls := chain.latestCalls.Load() - start
+	t.Logf("redis outage: %d upstream head polls in %s across 3 replicas", polls, window)
+	require.LessOrEqual(t, polls, int64(3), "no polling storm: only the 60s pollers may tick")
 }

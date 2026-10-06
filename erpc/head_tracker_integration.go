@@ -23,7 +23,8 @@ func (nr *NetworksRegistry) initHeadTracker(network *Network, nwCfg *common.Netw
 	if nr.upstreamsRegistry == nil || nr.upstreamsRegistry.SharedStateRegistry() == nil {
 		return fmt.Errorf("evm.headTracker requires a sharedState registry")
 	}
-	cfg := nwCfg.Evm.HeadTracker
+	// Work on a copy: the network config is shared (and may be re-read).
+	cfg := nwCfg.Evm.HeadTracker.Copy()
 	cfg.SetDefaults()
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -251,11 +252,7 @@ func (n *Network) EvmTrackedHead() int64 {
 	if ht == nil {
 		return 0
 	}
-	v := ht.head.GetValue()
-	if v <= 0 || ht.head.IsStale(ht.staleAfter()) {
-		return 0
-	}
-	return v
+	return ht.fresh()
 }
 
 // suggestServedHeight advances the serving upstream's known head to a
@@ -276,4 +273,18 @@ func (n *Network) suggestServedHeight(resp *common.NormalizedResponse, blockNumb
 	if sp := eu.EvmStatePoller(); sp != nil && !sp.IsObjectNull() && sp.LatestBlock() < blockNumber {
 		sp.SuggestLatestBlock(blockNumber)
 	}
+}
+
+// configuredUpperLatestBlockMinus returns the upstream's configured
+// blockAvailability.upper.latestBlockMinus, or nil.
+func configuredUpperLatestBlockMinus(u common.Upstream) *int64 {
+	cfg := u.Config()
+	if cfg == nil || cfg.Evm == nil || cfg.Evm.BlockAvailability == nil || cfg.Evm.BlockAvailability.Upper == nil {
+		return nil
+	}
+	up := cfg.Evm.BlockAvailability.Upper
+	if up.ExactBlock != nil {
+		return nil
+	}
+	return up.LatestBlockMinus
 }

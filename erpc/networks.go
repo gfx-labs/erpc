@@ -816,6 +816,13 @@ func (n *Network) EvmHighestLatestBlockNumber(ctx context.Context) int64 {
 		if h := n.headTracker.FreshHead(); h > 0 {
 			return h
 		}
+		// Degraded mode (S7): never serve below the last fresh tracker head
+		// this replica served, so eth_blockNumber does not jump back by up to
+		// a poller interval when the tracker goes stale. The floor expires
+		// after headTrackerFallbackFloorTTL (fail open, like the served-tip
+		// regression guard) so it cannot wedge on a halted chain.
+		pollerHead := n.evmPollerLatestBlockNumber(ctx, span)
+		return max(pollerHead, n.headTracker.FallbackFloor())
 	}
 	return n.evmPollerLatestBlockNumber(ctx, span)
 }
@@ -893,10 +900,10 @@ func (n *Network) tryShortCircuitFutureBlock(ctx context.Context, req *common.No
 	}
 	useFinalized := n.cfg.Evm.EmptyResultConfidence == common.AvailbilityConfidenceFinalized
 	maxHead := n.evmHeadReference(ctx, useFinalized).Available
-	if !useFinalized && n.headTracker != nil {
-		// The tracker head is a block an upstream has served, even while
-		// the slow per-upstream pollers have not caught up to it.
-		maxHead = max(maxHead, n.headTracker.Head())
+	if !useFinalized {
+		// The fresh tracker head is a block an upstream has served, even
+		// while the slow per-upstream pollers have not caught up to it.
+		maxHead = max(maxHead, n.EvmTrackedHead())
 	}
 	if maxHead <= 0 || bn <= maxHead {
 		// Unknown head (fail open) or block within reach of some upstream.
@@ -3068,6 +3075,19 @@ func (n *Network) checkUpstreamBlockAvailability(ctx context.Context, u common.U
 	// Above the configured upper bound. Classify retryability by distance to the live
 	// head: a block just ahead of the head (e.g. upper=latestBlockMinus:0) may become
 	// serveable shortly, so it is retryable within MaxRetryableBlockDistance.
+	//
+	// Head tracker: an upper bound derived from the head (latestBlockMinus) is
+	// computed from this upstream's slow poller view, which the fresh tracker
+	// head runs ahead of. Re-derive it from the tracked head so the upstream is
+	// not skipped (and force-polled) for blocks it serves; a static exactBlock
+	// cap is a declared serving range and stays as configured.
+	if maxBound != math.MaxInt64 && bn > maxBound {
+		if minus := configuredUpperLatestBlockMinus(eu); minus != nil {
+			if tracked := n.EvmTrackedHead(); tracked > 0 && tracked-*minus > maxBound {
+				maxBound = tracked - *minus
+			}
+		}
+	}
 	if maxBound != math.MaxInt64 && bn > maxBound {
 		telemetry.MetricUpstreamStaleUpperBound.WithLabelValues(
 			n.projectId, eu.VendorName(), n.Label(), eu.Id(), method, common.AvailbilityConfidenceBlockHead.String(),

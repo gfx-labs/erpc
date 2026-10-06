@@ -153,9 +153,13 @@ Rejections increment `erpc_head_tracker_rejected_total{reason}`.
 
 **Gotchas**
 
-1. Upstreams behind the tracker head may receive requests for a block they do not have yet. Missing-data retry and failover, plus the on-demand force-poll in block-range availability checks, handle this. The upstream that served the leader's poll is advanced through `SuggestLatestBlock`.
-2. The future-block short-circuit treats the tracker head as available, so the advertised head is never nulled out by stale poller views.
-3. A halted chain looks like a stale tracker. After `max(3·blockTime, 5s)` replicas enter fallback (`erpc_head_tracker_fallback_active=1` plus a WARN at most once a minute).
+1. Upstreams behind the tracker head may receive requests for a block they do not have yet. While the tracker head is fresh, availability gates treat any block at or below it as servable and do **not** force-poll the upstream's head: `EvmAssertBlockAvailability` (eth_getLogs/trace_filter), the network block-availability gate (a `latestBlockMinus` upper bound is re-derived from the tracked head, while a static `exactBlock` cap is unchanged), `handleBlockSkip`'s async poll, and the `maxAvailableRecentBlocks` pruning window. An upstream that really lacks the block answers empty or with an error, and missing-data retry and failover move the request to another upstream. An upstream that serves a tracked height has its known head advanced through `SuggestLatestBlock`.
+2. The future-block short-circuit treats the fresh tracker head as available, so the advertised head is never nulled out by stale poller views.
+3. A halted chain looks like a stale tracker. After `max(3·blockTime, 5s)` without a locally observed advance (measured on each replica's own clock, never the writer's), replicas enter fallback (`erpc_head_tracker_fallback_active=1` plus a WARN at most once a minute). In fallback, served latest is floored at the last fresh tracker head for up to 1 minute, so `eth_blockNumber` never goes backwards.
+4. The leader writes the polled block to the cache and block store **before** publishing the head, so a follower that sees the new head always finds the block. On a same-height reorg (same number, new hash) it rewrites the cached block.
+5. The first head a leader accepts must come from an upstream whose `eth_chainId` matches. A published head that is more than 1024 blocks ahead of three consecutive, mutually consistent polls is treated as poisoned and rolled back (`erpc_head_tracker_rejected_total{reason="recovered_rollback"}`).
+6. A leader stops polling and never publishes once `2/3·leaseTtl` has passed since its last successful lease renewal, even while a renewal is in flight. Two pods therefore never publish at the same time.
+7. If shared state (Redis) is down, no pod can hold the lease and none polls. Every pod falls back to the per-upstream pollers, with no polling storm.
 
 | Metric | Type | Labels |
 |---|---|---|

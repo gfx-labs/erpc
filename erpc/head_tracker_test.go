@@ -145,6 +145,7 @@ func TestHeadTracker_RegressionAndFutureGuards(t *testing.T) {
 	require.Equal(t, int64(1), verified.Load(), "major jump verifies chain id")
 	chainOk = false
 	require.Equal(t, "chain_id", ht.reject(ctx, &headObservation{Number: 1100, Upstream: up}, 1000, now, bt))
+	ht.prev = &headObservation{Number: 1000}
 	require.Empty(t, ht.reject(ctx, &headObservation{Number: 1010, Upstream: up}, 1000, now, bt), "small move needs no verification")
 }
 
@@ -152,15 +153,21 @@ func TestHeadTracker_TickPublishesAndCallsBack(t *testing.T) {
 	ssr := newTestSSR(t, t.Context())
 	chain := &fakeChain{start: time.Now().Add(-10 * time.Second), blockTime: time.Second, base: 100}
 	var accepted []int64
+	var publishedAtWrite int64 = -1
 	ht := newTestTracker(ssr, nil, headTrackerDeps{
-		poll:       chain.poll,
-		blockTime:  func() time.Duration { return time.Second },
-		onAccepted: func(_ context.Context, o *headObservation) { accepted = append(accepted, o.Number) },
+		poll:      chain.poll,
+		blockTime: func() time.Duration { return time.Second },
 	})
+	ht.deps.onAccepted = func(_ context.Context, o *headObservation) {
+		accepted = append(accepted, o.Number)
+		publishedAtWrite = ht.Head()
+	}
+	ht.leaseDeadlineNs.Store(time.Now().Add(time.Hour).UnixNano())
 	_, err := ht.tick(t.Context())
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, ht.Head(), int64(110))
 	require.Equal(t, []int64{ht.Head()}, accepted)
+	require.Zero(t, publishedAtWrite, "S1: the block is written BEFORE the head is published")
 	require.Equal(t, ht.Head(), ht.FreshHead())
 
 	// Same head again: no second callback.
@@ -182,8 +189,102 @@ func TestHeadTracker_FallbackWhenStale(t *testing.T) {
 	require.Zero(t, ht.FreshHead(), "no head yet")
 	require.True(t, ht.inFallback.Load())
 	ht.head.TryUpdate(t.Context(), 42)
-	require.Equal(t, int64(42), ht.FreshHead())
+	require.Zero(t, ht.FreshHead(), "the first value a replica learns is not proof of freshness (could be an hours-old counter)")
+	ht.head.TryUpdate(t.Context(), 43)
+	require.Equal(t, int64(43), ht.FreshHead())
 	require.False(t, ht.inFallback.Load())
+}
+
+// S5: freshness is the LOCAL receipt time of an advance, never the remote
+// writer's timestamp, so a skewed clock on the leader cannot make followers
+// treat a stale head as fresh (or a fresh one as stale).
+func TestHeadTracker_FreshnessUsesLocalClock(t *testing.T) {
+	ssr := newTestSSR(t, t.Context())
+	now := time.Now()
+	ht := newTestTracker(ssr, nil, headTrackerDeps{
+		blockTime: func() time.Duration { return time.Second },
+		now:       func() time.Time { return now },
+	})
+	ht.head.TryUpdate(t.Context(), 100)
+	ht.head.TryUpdate(t.Context(), 101)
+	require.Equal(t, int64(101), ht.FreshHead())
+	// Local time moves past the staleness window with no advance: stale,
+	// whatever timestamps the shared counter carries.
+	now = now.Add(headTrackerMinStale + time.Second)
+	require.Zero(t, ht.FreshHead())
+	// S7: the fallback floor is the last fresh head, for a bounded time.
+	require.Equal(t, int64(101), ht.FallbackFloor())
+	now = now.Add(headTrackerFallbackFloorTTL)
+	require.Zero(t, ht.FallbackFloor(), "the floor fails open after its TTL")
+}
+
+// S2: same height, different hash: the cached head block is rewritten.
+func TestHeadTracker_SameHeightReorgRewritesBlock(t *testing.T) {
+	ssr := newTestSSR(t, t.Context())
+	hash := "0xaa"
+	var written []string
+	ht := newTestTracker(ssr, nil, headTrackerDeps{
+		blockTime: func() time.Duration { return time.Second },
+		poll: func(context.Context, bool) (*headObservation, error) {
+			return &headObservation{Number: 500, Hash: hash, Timestamp: time.Now().Unix()}, nil
+		},
+		onAccepted: func(_ context.Context, o *headObservation) { written = append(written, o.Hash) },
+	})
+	ht.leaseDeadlineNs.Store(time.Now().Add(time.Hour).UnixNano())
+	_, err := ht.tick(t.Context())
+	require.NoError(t, err)
+	_, err = ht.tick(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, []string{"0xaa"}, written, "same block twice: written once")
+	hash = "0xbb"
+	_, err = ht.tick(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, []string{"0xaa", "0xbb"}, written, "reorged head block is rewritten")
+	require.Equal(t, int64(500), ht.Head())
+}
+
+// S3: the first head is verified (chain id), and a poisoned published head
+// is recovered from after headTrackerRecoverAfter consistent polls.
+func TestHeadTracker_BogusFirstHeadAndRecovery(t *testing.T) {
+	ssr := newTestSSR(t, t.Context())
+	up := common.NewFakeUpstream("u1")
+	wrongChain := true
+	n := int64(1000)
+	ht := newTestTracker(ssr, nil, headTrackerDeps{
+		blockTime: func() time.Duration { return time.Second },
+		poll: func(context.Context, bool) (*headObservation, error) {
+			return &headObservation{Number: n, Upstream: up, Timestamp: time.Now().Unix()}, nil
+		},
+		verifyChainId: func(context.Context, common.Upstream) (bool, error) { return !wrongChain, nil },
+	})
+	ht.leaseDeadlineNs.Store(time.Now().Add(time.Hour).UnixNano())
+	_, _ = ht.tick(t.Context())
+	require.Zero(t, ht.Head(), "a first head from a wrong-chain upstream is not published")
+
+	// A poisoned counter (another chain's height published earlier).
+	wrongChain = false
+	ht.head.TryUpdate(t.Context(), 50_000_000)
+	for i := 0; i < headTrackerRecoverAfter-1; i++ {
+		_, _ = ht.tick(t.Context())
+		require.Equal(t, int64(50_000_000), ht.Head(), "a single regressing poll is not enough")
+		n++
+	}
+	_, _ = ht.tick(t.Context())
+	require.Equal(t, n, ht.Head(), "consistent polls recover from the poisoned head")
+}
+
+// S4: a leader past its hard lease deadline never publishes.
+func TestHeadTracker_NoPublishPastLeaseDeadline(t *testing.T) {
+	ssr := newTestSSR(t, t.Context())
+	ht := newTestTracker(ssr, nil, headTrackerDeps{
+		blockTime: func() time.Duration { return time.Second },
+		poll: func(context.Context, bool) (*headObservation, error) {
+			return &headObservation{Number: 77, Timestamp: time.Now().Unix()}, nil
+		},
+	})
+	ht.leaseDeadlineNs.Store(time.Now().Add(-time.Millisecond).UnixNano())
+	_, _ = ht.tick(t.Context())
+	require.Zero(t, ht.Head())
 }
 
 // Several replicas share one shared state: exactly one polls, ~1 call per
@@ -232,6 +333,31 @@ func TestHeadTracker_ElectionAndFailover(t *testing.T) {
 	}
 	require.Eventually(t, func() bool { return leader() >= 0 }, 3*time.Second, 10*time.Millisecond)
 
+	// Sample leadership continuously over the window: never two at once.
+	stopSampling := make(chan struct{})
+	var maxLeaders atomic.Int32
+	go func() {
+		tk := time.NewTicker(5 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stopSampling:
+				return
+			case <-tk.C:
+				var c int32
+				for _, tr := range trackers {
+					if tr.IsLeader() {
+						c++
+					}
+				}
+				if c > maxLeaders.Load() {
+					maxLeaders.Store(c)
+				}
+			}
+		}
+	}()
+	defer close(stopSampling)
+
 	window := 5 * time.Second
 	startCalls := chain.calls.Load()
 	time.Sleep(window)
@@ -249,6 +375,7 @@ func TestHeadTracker_ElectionAndFailover(t *testing.T) {
 	}
 	mu.Unlock()
 	require.Equal(t, 1, pollers, "only the leader polls")
+	require.LessOrEqual(t, maxLeaders.Load(), int32(1), "never two concurrent leaders")
 	expected, _ := chain.headAt(time.Now())
 	for _, tr := range trackers {
 		require.GreaterOrEqual(t, tr.Head(), expected-2, "every replica sees the head within ~1 block")

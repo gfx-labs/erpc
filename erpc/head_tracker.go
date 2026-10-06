@@ -78,6 +78,15 @@ const (
 	headTrackerFutureSlack = 60 * time.Second
 	// headTrackerWarnEvery rate-limits the fallback WARN log.
 	headTrackerWarnEvery = time.Minute
+	// headTrackerRecoverAfter is how many consecutive, mutually consistent
+	// polls below the regression tolerance it takes to accept a large
+	// rollback: the recovery path for a published head that was poisoned
+	// (a bogus far-future value that every honest poll now "regresses" from).
+	headTrackerRecoverAfter = 3
+	// headTrackerFallbackFloorTTL bounds how long the fallback keeps serving
+	// the last fresh tracker head as a floor (the same one-minute bound the
+	// served-tip regression guard uses), so a floor can never become a wedge.
+	headTrackerFallbackFloorTTL = servedTipRegressionTTL
 )
 
 // headObservation is one parsed leader poll result.
@@ -133,6 +142,27 @@ type headTracker struct {
 	prev   *headObservation
 	prevAt time.Time
 	delays []time.Duration
+	// regressStreak / regressLast track consecutive consistent regression
+	// rejections (poisoned-counter recovery).
+	regressStreak int
+	regressLast   int64
+
+	// leaseDeadlineNs is the instant (unix ns, local clock) after which this
+	// replica can no longer prove it holds the lease: lastOk + 2·ttl/3. The
+	// leader stops polling and never publishes past it (S4).
+	leaseDeadlineNs atomic.Int64
+
+	// advancedAtNs is the LOCAL receipt time of the last head advance this
+	// replica observed (leader publish or pub/sub delivery). Freshness is
+	// measured against it, never against the remote writer's clock (S5).
+	// seenHead is the last head value this replica observed through the
+	// counter callback.
+	advancedAtNs atomic.Int64
+	seenHead     atomic.Int64
+	// lastFreshHead / lastFreshAtNs remember the last head served as fresh,
+	// the floor for the fallback path (S7).
+	lastFreshHead atomic.Int64
+	lastFreshAtNs atomic.Int64
 
 	stopOnce sync.Once
 	stop     context.CancelFunc
@@ -148,7 +178,7 @@ func newHeadTracker(projectId, networkId, label string, cfg *common.EvmHeadTrack
 	}
 	lg := logger.With().Str("component", "headTracker").Logger()
 	scope := projectId + "/" + networkId
-	return &headTracker{
+	t := &headTracker{
 		projectId: projectId,
 		networkId: networkId,
 		label:     label,
@@ -159,6 +189,15 @@ func newHeadTracker(projectId, networkId, label string, cfg *common.EvmHeadTrack
 		deps:      deps,
 		logger:    &lg,
 	}
+	// A head counts as fresh only once THIS replica has seen it advance: the
+	// first value it learns (initial fetch of a possibly hours-old counter
+	// after boot) only seeds seenHead.
+	t.head.OnValue(func(v int64) {
+		if prev := t.seenHead.Swap(v); prev > 0 && v != prev {
+			t.advancedAtNs.Store(t.deps.now().UnixNano())
+		}
+	})
+	return t
 }
 
 // Head returns the latest published tracker head, 0 when none.
@@ -185,6 +224,31 @@ func (t *headTracker) staleAfter() time.Duration {
 	return max(headTrackerStaleBlocks*t.blockTime(), headTrackerMinStale)
 }
 
+// fresh reports the head when this replica saw it advance within staleAfter
+// (local clock), else 0. No side effects.
+func (t *headTracker) fresh() int64 {
+	v := t.head.GetValue()
+	at := t.advancedAtNs.Load()
+	if v <= 0 || at == 0 || t.deps.now().Sub(time.Unix(0, at)) > t.staleAfter() {
+		return 0
+	}
+	return v
+}
+
+// FallbackFloor is the last head served as fresh, while it is younger than
+// headTrackerFallbackFloorTTL, else 0. The fallback path never serves below
+// it, so eth_blockNumber does not go backwards when the tracker goes stale.
+func (t *headTracker) FallbackFloor() int64 {
+	if t == nil {
+		return 0
+	}
+	at := t.lastFreshAtNs.Load()
+	if at == 0 || t.deps.now().Sub(time.Unix(0, at)) > headTrackerFallbackFloorTTL {
+		return 0
+	}
+	return t.lastFreshHead.Load()
+}
+
 // FreshHead returns the tracker head when it advanced recently enough to be
 // served, else 0 (the caller falls back). It records fallback transitions.
 func (t *headTracker) FreshHead() int64 {
@@ -192,12 +256,16 @@ func (t *headTracker) FreshHead() int64 {
 		return 0
 	}
 	v := t.head.GetValue()
-	if v > 0 && !t.head.IsStale(t.staleAfter()) {
+	if f := t.fresh(); f > 0 {
+		if t.lastFreshHead.Load() != f {
+			t.lastFreshHead.Store(f)
+		}
+		t.lastFreshAtNs.Store(t.deps.now().UnixNano())
 		if t.inFallback.Load() && t.inFallback.Swap(false) {
 			telemetry.MetricHeadTrackerFallbackActive.WithLabelValues(t.projectId, t.label).Set(0)
-			t.logger.Info().Int64("head", v).Msg("head tracker head is fresh again; serving it as latest")
+			t.logger.Info().Int64("head", f).Msg("head tracker head is fresh again; serving it as latest")
 		}
-		return v
+		return f
 	}
 	if !t.inFallback.Load() && !t.inFallback.Swap(true) {
 		telemetry.MetricHeadTrackerFallbackActive.WithLabelValues(t.projectId, t.label).Set(1)
@@ -295,6 +363,8 @@ func (t *headTracker) run(ctx context.Context) {
 func (t *headTracker) lead(ctx context.Context, lease data.Lease, ttl time.Duration) {
 	session, cancel := context.WithCancel(ctx)
 	defer cancel()
+	hold := ttl * 2 / 3
+	t.leaseDeadlineNs.Store(t.deps.now().Add(hold).UnixNano())
 	t.isLeader.Store(true)
 	telemetry.MetricHeadTrackerIsLeader.WithLabelValues(t.projectId, t.label).Set(1)
 	t.logger.Info().Str("instance", t.ssr.InstanceId()).Msg("head tracker acquired leadership")
@@ -310,11 +380,32 @@ func (t *headTracker) lead(ctx context.Context, lease data.Lease, ttl time.Durat
 		t.logger.Info().Msg("head tracker released leadership")
 	}()
 
+	// Watchdog (S4): the session ends the moment the hard deadline
+	// (last successful renew + 2·ttl/3) passes, even while a renew call is
+	// still in flight, so this replica stops polling before another one can
+	// legitimately acquire the expired lease.
 	go func() {
 		defer cancel()
-		lastOk := t.deps.now()
+		for {
+			d := time.Until(time.Unix(0, t.leaseDeadlineNs.Load()))
+			if d <= 0 {
+				if session.Err() == nil {
+					t.logger.Warn().Msg("head tracker cannot prove it still holds the lease; stepping down")
+				}
+				return
+			}
+			if !sleepCtx(session, d) {
+				return
+			}
+		}
+	}()
+	// Renewer: every ttl/3. The deadline extends from the instant the renew
+	// was SENT (conservative: Redis applied the new expiry no earlier).
+	go func() {
+		defer cancel()
 		for sleepCtx(session, ttl/3) {
-			rctx, rcancel := context.WithTimeout(session, ttl/3)
+			sentAt := t.deps.now()
+			rctx, rcancel := context.WithDeadline(session, time.Unix(0, t.leaseDeadlineNs.Load()))
 			ok, err := lease.Renew(rctx, ttl)
 			rcancel()
 			if err == nil && !ok {
@@ -322,14 +413,7 @@ func (t *headTracker) lead(ctx context.Context, lease data.Lease, ttl time.Durat
 				return
 			}
 			if err == nil {
-				lastOk = t.deps.now()
-				continue
-			}
-			if t.deps.now().Sub(lastOk) >= ttl*2/3 {
-				// Cannot prove we still hold it: stop polling before another
-				// replica can legitimately take over.
-				t.logger.Warn().Err(err).Msg("head tracker cannot renew its lease; stepping down")
-				return
+				t.leaseDeadlineNs.Store(sentAt.Add(hold).UnixNano())
 			}
 		}
 	}()
@@ -378,19 +462,55 @@ func (t *headTracker) tick(ctx context.Context) (time.Duration, error) {
 	}
 
 	current := t.head.GetValue()
-	if reason := t.reject(ctx, obs, current, now, bt); reason != "" {
+	reason := t.reject(ctx, obs, current, now, bt)
+	if reason == "regression" && t.recoverFromPoisonedHead(ctx, obs, current) {
+		reason = ""
+	} else if reason != "regression" {
+		t.regressStreak, t.regressLast = 0, 0
+	}
+	if reason != "" {
 		telemetry.MetricHeadTrackerRejectedTotal.WithLabelValues(t.projectId, t.label, reason).Inc()
 		t.logger.Warn().Int64("observed", obs.Number).Int64("current", current).Str("reason", reason).
 			Str("upstreamId", upstreamIdOf(obs.Upstream)).Msg("head tracker rejected a polled head")
 		return retry, nil
 	}
 
-	if obs.Number <= current {
-		// Same (or a slightly lagging) head: the next block is not out yet.
+	recovering := current-obs.Number > common.DefaultToleratedBlockHeadRollback
+	if obs.Number < current && !recovering {
+		// A slightly lagging upstream answered: the next block is not out yet.
+		return t.staleWait(obs, now, bt), nil
+	}
+	if obs.Number == current {
+		// Same height. A different hash is a same-height reorg (S2): the
+		// cached block and the block store entry for this height are
+		// orphaned, so rewrite them with the new canonical block. The
+		// published number does not change.
+		if p := t.prev; p != nil && p.Number == obs.Number && p.Hash != "" && obs.Hash != "" && p.Hash != obs.Hash {
+			t.logger.Info().Int64("number", obs.Number).Str("orphan", p.Hash).Str("canonical", obs.Hash).
+				Msg("head tracker observed a same-height reorg; replacing the cached head block")
+			if t.deps.onAccepted != nil {
+				t.deps.onAccepted(ctx, obs)
+			}
+			t.prev = obs
+		} else if t.prev == nil {
+			t.prev, t.prevAt = obs, now
+		}
 		return t.staleWait(obs, now, bt), nil
 	}
 
-	// New head: publish first (followers serve it), then the side effects.
+	// New head. Write the polled block to the cache / block store FIRST
+	// (S1), then publish: a follower that learns the new head must find its
+	// block already written, or its rewritten "latest" read would miss and
+	// go upstream.
+	if t.deps.onAccepted != nil {
+		t.deps.onAccepted(ctx, obs)
+	}
+	if !t.holdsLease() || ctx.Err() != nil {
+		// The lease may have passed to another replica while writing: never
+		// publish without it (S4).
+		return retry, ctx.Err()
+	}
+	t.advancedAtNs.Store(t.deps.now().UnixNano())
 	t.head.TryUpdate(ctx, obs.Number)
 	if obs.Timestamp > 0 {
 		delay := now.Sub(time.Unix(obs.Timestamp, 0))
@@ -403,10 +523,53 @@ func (t *headTracker) tick(ctx context.Context) (time.Duration, error) {
 		}
 	}
 	t.prev, t.prevAt = obs, now
-	if t.deps.onAccepted != nil {
-		t.deps.onAccepted(ctx, obs)
-	}
 	return t.newHeadWait(obs, now, bt), nil
+}
+
+// recoverFromPoisonedHead decides whether a poll that "regresses" more than
+// the rollback tolerance below the published head is in fact the truth: the
+// published head was poisoned (a bogus far-future value accepted before any
+// guard could compare it with anything, or a wrong-chain value) and every
+// honest poll now looks like a regression. After headTrackerRecoverAfter
+// consecutive regressing polls that are mutually consistent (each at or
+// slightly above the previous, i.e. a chain moving forward from far below
+// the published head), and whose serving upstream passes the chain-id check,
+// the rollback is accepted. Counted as rejected reason="recovered_rollback".
+func (t *headTracker) recoverFromPoisonedHead(ctx context.Context, obs *headObservation, current int64) bool {
+	consistent := t.regressStreak > 0 && obs.Number >= t.regressLast && obs.Number-t.regressLast <= t.deps.majorMove()
+	if consistent {
+		t.regressStreak++
+	} else {
+		t.regressStreak = 1
+	}
+	t.regressLast = obs.Number
+	if t.regressStreak < headTrackerRecoverAfter {
+		return false
+	}
+	if !t.chainIdOk(ctx, obs) {
+		return false
+	}
+	t.regressStreak, t.regressLast = 0, 0
+	telemetry.MetricHeadTrackerRejectedTotal.WithLabelValues(t.projectId, t.label, "recovered_rollback").Inc()
+	t.logger.Error().Int64("published", current).Int64("observed", obs.Number).Int("consecutivePolls", headTrackerRecoverAfter).
+		Msg("head tracker published head was far ahead of every consistent poll; accepting the rollback")
+	return true
+}
+
+// chainIdOk verifies the serving upstream is on this network's chain.
+func (t *headTracker) chainIdOk(ctx context.Context, obs *headObservation) bool {
+	if t.deps.verifyChainId == nil || obs.Upstream == nil {
+		return true
+	}
+	vctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ok, err := t.deps.verifyChainId(vctx, obs.Upstream)
+	return err == nil && ok
+}
+
+// holdsLease reports whether the hard lease deadline has not passed.
+func (t *headTracker) holdsLease() bool {
+	return t.deps.now().UnixNano() < t.leaseDeadlineNs.Load()
 }
 
 // reject applies the agreement-free sanity guards; "" accepts.
@@ -426,13 +589,13 @@ func (t *headTracker) reject(ctx context.Context, obs *headObservation, current 
 			return "far_future"
 		}
 	}
-	if current > 0 && obs.Number-current > t.deps.majorMove() && t.deps.verifyChainId != nil && obs.Upstream != nil {
-		vctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		ok, err := t.deps.verifyChainId(vctx, obs.Upstream)
-		cancel()
-		if err != nil || !ok {
-			return "chain_id"
-		}
+	// The first head this leader accepts is compared with nothing (the
+	// counter may be empty, or seeded by another leader), and a major jump
+	// could be another chain's height: both need the serving upstream's
+	// chain id to match (S3).
+	firstAccept := t.prev == nil && (current == 0 || obs.Number > current)
+	if (firstAccept || (current > 0 && obs.Number-current > t.deps.majorMove())) && !t.chainIdOk(ctx, obs) {
+		return "chain_id"
 	}
 	return ""
 }
