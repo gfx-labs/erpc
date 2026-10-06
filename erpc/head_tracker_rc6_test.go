@@ -9,9 +9,53 @@ import (
 
 	"github.com/erpc/erpc/common"
 	"github.com/erpc/erpc/health"
+	"github.com/erpc/erpc/util"
 	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/require"
 )
+
+func init() { util.ConfigureTestLogger() }
+
+// Unlike cold-start coverage, begin with a warm but wrong six-second EMA.
+// Drive the real tick and health EMA: sparse observations must recover
+// rather than validate their own spacing.
+func TestHeadTracker_UnderPolledLeaderConverges(t *testing.T) {
+	for _, bt := range []time.Duration{time.Second, 2 * time.Second} {
+		t.Run(bt.String(), func(t *testing.T) {
+			start := time.Unix(1_700_000_000, 0)
+			tr := health.NewTracker(&log.Logger, "p", time.Minute)
+			for i := int64(0); i <= 4; i++ {
+				tr.ObserveNetworkHead("evm:1", "n", 996+i, start.Unix()-24+6*i)
+			}
+			require.Equal(t, 6*time.Second, tr.GetNetworkBlockTime("evm:1"))
+			c := regularChain(start, bt, 400*time.Millisecond, 1000)
+			var steadyPolls int
+			var first, last int64
+			polls, heads, lag, _ := runSimLeader(t, c, func() time.Duration { return tr.GetNetworkBlockTime("evm:1") }, start, 2*time.Minute, func(ht *headTracker) {
+				ht.deps.onAccepted = func(_ context.Context, obs *headObservation) {
+					tr.ObserveNetworkHead("evm:1", "n", obs.Number, obs.Timestamp)
+				}
+				poll := ht.deps.poll
+				ht.deps.poll = func(ctx context.Context, full bool) (*headObservation, error) {
+					obs, err := poll(ctx, full)
+					if ht.deps.now().Sub(start) >= time.Minute {
+						if steadyPolls == 0 {
+							first = obs.Number
+						}
+						steadyPolls++
+						last = obs.Number
+					}
+					return obs, err
+				}
+			})
+			perBlock := float64(steadyPolls-1) / float64(last-first)
+			t.Logf("%s seeded at 6s: %d polls, %d blocks, steady %.3f polls/block, mean lag %.3f, EMA %s", bt, polls, heads, perBlock, lag, tr.GetNetworkBlockTime("evm:1"))
+			require.InDelta(t, 1, perBlock, 0.2, "must converge within one minute")
+			require.LessOrEqual(t, lag, 1.0)
+			require.InDelta(t, float64(bt), float64(tr.GetNetworkBlockTime("evm:1")), float64(bt)/10)
+		})
+	}
+}
 
 // rc.6 regressions found on staging (rc.5, 2026-10-06):
 //   - a single poll slower than one block time forked a second, permanently
@@ -27,9 +71,9 @@ type simChain struct {
 }
 
 // runSimLeader drives one leader's tick loop on a virtual clock for `total`,
-// and returns polls, heads advanced and the mean lag (blocks) behind what was
-// visible.
-func runSimLeader(t *testing.T, c *simChain, blockTime func() time.Duration, start time.Time, total time.Duration, prep func(*headTracker)) (polls int, heads int64, meanLag float64) {
+// and returns polls, heads advanced, and the mean and maximum lag (blocks)
+// behind what was visible after the startup window.
+func runSimLeader(t *testing.T, c *simChain, blockTime func() time.Duration, start time.Time, total time.Duration, prep func(*headTracker)) (polls int, heads int64, meanLag float64, maxLag int64) {
 	t.Helper()
 	ctx := t.Context()
 	ssr := newTestSSR(t, ctx)
@@ -59,12 +103,14 @@ func runSimLeader(t *testing.T, c *simChain, blockTime func() time.Duration, sta
 			}
 		}
 		if now.Sub(start) > 30*time.Second {
-			lagSum += float64(1000 + int64(c.visible(now)) - ht.Head())
+			lag := 1000 + int64(c.visible(now)) - ht.Head()
+			maxLag = max(maxLag, lag)
+			lagSum += float64(lag)
 			lagN++
 		}
 		now = now.Add(20 * time.Millisecond)
 	}
-	return polls, ht.Head() - first, lagSum / float64(max(lagN, 1))
+	return polls, ht.Head() - first, lagSum / float64(max(lagN, 1)), maxLag
 }
 
 // regularChain: one block per bt, visible `delay` after its (whole-second)
@@ -97,7 +143,7 @@ func TestHeadTracker_ColdStartPollsAboutOncePerBlock(t *testing.T) {
 			c := regularChain(start, tc.bt, tc.delay, 2000)
 			// The network EMA stays cold for the whole run: the tracker must
 			// not rely on it.
-			polls, heads, lag := runSimLeader(t, c, func() time.Duration { return 0 }, start, 5*time.Minute, nil)
+			polls, heads, lag, _ := runSimLeader(t, c, func() time.Duration { return 0 }, start, 5*time.Minute, nil)
 			perBlock := float64(polls) / float64(heads)
 			t.Logf("%s cold start: %d polls, %d heads: %.2f polls/block, mean lag %.2f blocks", tc.name, polls, heads, perBlock, lag)
 			require.LessOrEqual(t, perBlock, 1.2, "cold start must not over-poll")
@@ -155,10 +201,9 @@ func TestHeadTracker_QuickBlockTimeEstimate(t *testing.T) {
 
 // Nibiru-like: blocks every 1s/2s alternately (1.5s mean, the EMA is right),
 // but the node exposes its head in steps every 2s of wall clock, 2.5s+
-// behind. A timestamp-anchored schedule polls before the step about half the
-// time; the wall-clock visibility cadence must bring it to ~1 poll per
-// visible head (~1 poll per 2s, not 1.11/s).
-func TestHeadTracker_BurstyVisibilityPollsOncePerVisibleHead(t *testing.T) {
+// behind. Normalize cadence per block even when heads arrive in batches.
+// Same-head backoff must keep polling near one call per block and lag bounded.
+func TestHeadTracker_BurstyVisibilityPollsAboutOncePerBlock(t *testing.T) {
 	start := time.Unix(1_700_000_000, 0)
 	c := &simChain{}
 	cur := start.Unix()
@@ -174,13 +219,12 @@ func TestHeadTracker_BurstyVisibilityPollsOncePerVisibleHead(t *testing.T) {
 		}
 		return n
 	}
-	polls, heads, lag := runSimLeader(t, c, func() time.Duration { return 1500 * time.Millisecond }, start, 10*time.Minute, nil)
+	polls, heads, lag, maxLag := runSimLeader(t, c, func() time.Duration { return 1500 * time.Millisecond }, start, 10*time.Minute, nil)
 	perHead := float64(polls) / float64(heads)
 	perSec := float64(polls) / (10 * 60)
-	t.Logf("bursty chain: %d polls, %d visible heads: %.2f polls/head, %.2f polls/s, mean lag %.2f blocks", polls, heads, perHead, perSec, lag)
-	require.LessOrEqual(t, perHead, 1.2)
-	require.LessOrEqual(t, perSec, 0.6, "~1 poll per 2s step")
-	require.LessOrEqual(t, lag, 1.0)
+	t.Logf("bursty chain: %d polls, %d blocks: %.2f polls/block, %.2f polls/s, mean lag %.2f, max lag %d blocks", polls, heads, perHead, perSec, lag, maxLag)
+	require.LessOrEqual(t, perHead, 1.1)
+	require.LessOrEqual(t, maxLag, int64(2))
 }
 
 // One poll slower than a block time used to fork the schedule: the surplus

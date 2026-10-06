@@ -11,9 +11,12 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/erpc/erpc/common"
 	"github.com/erpc/erpc/data"
+	"github.com/erpc/erpc/util"
 	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/require"
 )
+
+func init() { util.ConfigureTestLogger() }
 
 // fakeChain is a deterministic chain producing one block per blockTime, with
 // timestamps in whole seconds like a real chain.
@@ -84,12 +87,12 @@ func TestHeadTracker_AdaptiveWait(t *testing.T) {
 	ht.prev = &headObservation{Number: 10, Timestamp: ts}
 	w = ht.staleWait(&headObservation{Number: 10, Timestamp: ts}, blockAt.Add(time.Second), bt)
 	require.Equal(t, time.Second, w)
-	// Stale after the next block was due: retry at blockTime/4 (floor 500ms).
+	// Stale after the next block was due: retry at blockTime/2 (floor 500ms).
 	w = ht.staleWait(&headObservation{Number: 10, Timestamp: ts}, blockAt.Add(3*time.Second), bt)
-	require.Equal(t, 500*time.Millisecond, w)
+	require.Equal(t, time.Second, w)
 	w = newTestTracker(ssr, nil, headTrackerDeps{blockTime: func() time.Duration { return 12 * time.Second }}).
 		staleWait(&headObservation{Number: 10}, blockAt, 12*time.Second)
-	require.Equal(t, 3*time.Second, w, "retry is blockTime/4 on slow chains")
+	require.Equal(t, 6*time.Second, w, "retry is blockTime/2 before visibility cadence warms")
 
 	// Sub-second chains are floored at 500ms.
 	w = ht.newHeadWait(&headObservation{Number: 10, Timestamp: ts}, blockAt, 400*time.Millisecond)

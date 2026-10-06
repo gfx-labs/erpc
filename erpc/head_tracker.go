@@ -156,7 +156,7 @@ type headTracker struct {
 	delays []time.Duration
 	// visTimes are the estimated wall-clock moments the recent new heads
 	// became visible to the leader (last = current head). See noteVisible.
-	visTimes []time.Time
+	visTimes []headVisibility
 	// regressStreak / regressLast track consecutive consistent regression
 	// rejections (poisoned-counter recovery).
 	regressStreak int
@@ -217,6 +217,11 @@ type headTracker struct {
 	stopOnce sync.Once
 	stop     context.CancelFunc
 	done     chan struct{}
+}
+
+type headVisibility struct {
+	at     time.Time
+	number int64
 }
 
 func newHeadTracker(projectId, networkId, label string, cfg *common.EvmHeadTrackerConfig, ssr data.SharedStateRegistry, deps headTrackerDeps, logger *zerolog.Logger) *headTracker {
@@ -993,57 +998,41 @@ const headTrackerMinCadenceSamples = 4
 // headTrackerMaxStaleBackoff caps the same-head backoff (staleWait).
 const headTrackerMaxStaleBackoff = 30 * time.Second
 
-// noteVisible records when a new head became visible to the leader, on the
-// leader's wall clock, as an UPPER BOUND: the send time of the poll that
-// found it. One sample per distinct head; an interval longer than 4 block
-// times (a leader hiccup, an on-demand gap) is not cadence and restarts the
-// window.
-//
-// The schedule aims each poll cadenceLead before (last bound + cadence).
-// A hit there tightens the bound by the lead; a miss means the bound was
-// already within the lead of the real moment, and the retry (one stale
-// wait, >= MinHeadTrackerPollWait) lands after it. So the bound stays
-// within one retry of the real visibility moment and a miss costs one poll
-// every ~retry/lead heads (~1 extra poll per 20 heads: 500ms / 25ms on a
-// 2s cadence, 1.5s / 75ms on a 6s one).
-//
-// WHY wall clock. What the schedule must predict is when the NEXT head is
-// visible to the leader, and that is not always on-chain timestamp + block
-// time + delay. Nibiru's RPC exposes heads in steps of 1-2 blocks every
-// ~2.0s of wall clock while block timestamps alternate 1s/2s and the
-// observed delay swings 2.5-4.5s: a timestamp-anchored target lands before
-// the step about half the time (staging rc.5: 1.71 polls per block, 1.11
-// polls/s for one visible head per ~2s), while the wall-clock cadence is
-// regular to a few tens of ms. On a regular chain both give the same
-// answer (cadence = block time).
+// noteVisible records the send time and height of each accepted new head.
+// A timestamp alone measures our own polling rate, not the chain's rate:
+// skipping six blocks must contribute six blocks to the denominator.
+// Reset on backwards observations or long per-block gaps, not merely a long
+// time between polls (which can be the under-polling we need to correct).
+// Whole-window deltas cancel intermediate observation jitter.
 func (t *headTracker) noteVisible(prev, obs *headObservation, sent time.Time, bt time.Duration) {
 	v := sent
-	if n := len(t.visTimes); prev == nil || n == 0 || v.Sub(t.visTimes[n-1]) <= 0 || v.Sub(t.visTimes[n-1]) > 4*max(bt, time.Second) {
+	if n := len(t.visTimes); prev == nil || n == 0 || obs.Number <= t.visTimes[n-1].number || v.Sub(t.visTimes[n-1].at) <= 0 ||
+		v.Sub(t.visTimes[n-1].at)/time.Duration(obs.Number-t.visTimes[n-1].number) > 4*max(bt, time.Second) {
 		t.visTimes = t.visTimes[:0]
 	}
-	t.visTimes = append(t.visTimes, v)
+	t.visTimes = append(t.visTimes, headVisibility{at: v, number: obs.Number})
 	if len(t.visTimes) > headTrackerDelaySamples+1 {
 		t.visTimes = t.visTimes[1:]
 	}
 }
 
-// visibleCadence is the mean wall-clock interval between visible heads over
-// the window: (last - first) / intervals. The sum telescopes, so the error
-// of each bound (at most one retry late) cancels except at the two ends:
-// <= retry / window, well under cadenceLead once the window is full.
+// visibleCadence is the block-weighted mean wall-clock time per block:
+// sum(delta time) / sum(delta height). Every observation is normalized by
+// the blocks it spans, never counted as a single block. Multi-block jumps
+// therefore shorten an under-polled schedule instead of reinforcing it.
 // 0 until headTrackerMinCadenceSamples intervals.
 func (t *headTracker) visibleCadence() time.Duration {
 	n := len(t.visTimes) - 1
 	if n < headTrackerMinCadenceSamples {
 		return 0
 	}
-	return t.visTimes[n].Sub(t.visTimes[0]) / time.Duration(n)
+	return t.visTimes[n].at.Sub(t.visTimes[0].at) / time.Duration(t.visTimes[n].number-t.visTimes[0].number)
 }
 
 // visibleAt is the estimated moment the current head became visible.
 func (t *headTracker) visibleAt() time.Time {
 	if n := len(t.visTimes); n > 0 {
-		return t.visTimes[n-1]
+		return t.visTimes[n-1].at
 	}
 	return t.prevAt
 }
@@ -1067,6 +1056,9 @@ func (t *headTracker) newHeadWait(obs *headObservation, now time.Time, bt time.D
 		return max(common.MinHeadTrackerPollWait, bt)
 	}
 	if c := t.visibleCadence(); c > 0 {
+		// A stale EMA must not floor a corrected cadence at half its old
+		// value. The 500ms minimum still protects sub-second chains.
+		lo = max(common.MinHeadTrackerPollWait, min(bt, c)/2)
 		return clampDuration(t.visibleAt().Add(c-cadenceLead(c)).Sub(now), lo, c)
 	}
 	md := t.meanDelay()
@@ -1084,7 +1076,8 @@ func (t *headTracker) newHeadWait(obs *headObservation, now time.Time, bt time.D
 // produce the samples it needs, and samples > 120s are rejected) made the
 // retry a flat 500ms.
 //
-//	warm: base max(500ms, bt/4), doubling, capped at min(4·bt, 30s)
+//	warm: base max(500ms, visible cadence), or max(500ms, bt/2) before
+//	      cadence warms, doubling, capped at min(4·bt, 30s)
 //	cold: base 1s, doubling, capped at 30s
 //
 // The 30s cap bounds how late an on-demand chain's next block is seen; a
@@ -1107,7 +1100,12 @@ func (t *headTracker) staleWait(obs *headObservation, now time.Time, bt time.Dur
 			return clampDuration(target.Sub(now), common.MinHeadTrackerPollWait, bt)
 		}
 	}
-	base, ceiling := max(common.MinHeadTrackerPollWait, bt/4), max(common.MinHeadTrackerPollWait, min(4*bt, headTrackerMaxStaleBackoff))
+	base, ceiling := max(common.MinHeadTrackerPollWait, bt/2), max(common.MinHeadTrackerPollWait, min(4*bt, headTrackerMaxStaleBackoff))
+	if c := t.visibleCadence(); c > 0 {
+		// One per-block interval gives a batched head time to become
+		// visible without turning every early poll into rapid retries.
+		base = max(common.MinHeadTrackerPollWait, c)
+	}
 	if t.blockTimeCold() {
 		base, ceiling = time.Second, headTrackerMaxStaleBackoff
 	}
