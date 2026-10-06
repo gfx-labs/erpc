@@ -711,3 +711,108 @@ func TestHeadTracker_LeasesSpreadAcrossReplicas(t *testing.T) {
 	c, _ := counts()
 	t.Logf("leases per replica: %v", c)
 }
+
+// rc.5: an on-demand chain (a block every 60-300s, redbelly-like) with a COLD
+// block-time EMA (intervals > 120s are rejected by the EMA, so it never warms)
+// must not poll hundreds of times per block, and followers must not fall back.
+func TestHeadTracker_OnDemandChainBacksOff(t *testing.T) {
+	ctx := t.Context()
+	ssr := newTestSSR(t, ctx)
+	start := time.Unix(1_700_000_000, 0)
+	now := start
+	clock := func() time.Time { return now }
+	// Block schedule: gaps of 60, 300, 120, 200, 90, 240 ... seconds.
+	gaps := []time.Duration{60, 300, 120, 200, 90, 240, 75, 180}
+	var blockTimes []time.Time
+	at := start
+	for i := 0; at.Sub(start) < 40*time.Minute; i++ {
+		at = at.Add(gaps[i%len(gaps)] * time.Second)
+		blockTimes = append(blockTimes, at)
+	}
+	headAt := func(tm time.Time) (int64, int64) {
+		n, ts := int64(500), start.Unix()
+		for _, b := range blockTimes {
+			if b.After(tm) {
+				break
+			}
+			n++
+			ts = b.Unix()
+		}
+		return n, ts
+	}
+	polls := 0
+	leader := newTestTracker(ssr, nil, headTrackerDeps{
+		now: clock, blockTime: func() time.Duration { return 0 },
+		poll: func(context.Context, bool) (*headObservation, error) {
+			polls++
+			n, ts := headAt(now)
+			return &headObservation{Number: n, Hash: fmt.Sprintf("0x%x", n), Timestamp: ts}, nil
+		},
+	})
+	leader.leaseDeadlineNs.Store(start.Add(24 * time.Hour).UnixNano())
+	follower := newTestTracker(ssr, nil, headTrackerDeps{now: clock, blockTime: func() time.Duration { return 0 }})
+	next := start
+	stale, maxLag := 0, int64(0)
+	for now.Sub(start) < 40*time.Minute {
+		if !now.Before(next) {
+			w, err := leader.tick(ctx)
+			require.NoError(t, err)
+			next = now.Add(w)
+		}
+		if now.Sub(start) > time.Minute {
+			if follower.FreshHead() == 0 {
+				stale++
+			}
+			n, _ := headAt(now)
+			maxLag = max(maxLag, n-leader.Head())
+		}
+		now = now.Add(time.Second)
+	}
+	blocks := len(blockTimes)
+	perMin := float64(polls) / 40
+	t.Logf("on-demand chain: %d polls over 40 min, %d blocks: %.1f polls/block, %.2f polls/min; follower stale %ds; max head lag %d",
+		polls, blocks, float64(polls)/float64(blocks), perMin, stale, maxLag)
+	require.Zero(t, stale, "no fallback on an on-demand chain")
+	// Steady state between blocks is one poll per 30s (cold cap); each new
+	// block restarts the backoff (1,2,4,8,16s) so the next block is found
+	// quickly. ~4 polls/min = ~0.07/s, vs ~3/s before (rc.4 redbelly).
+	require.LessOrEqual(t, perMin, 4.5, "bounded polling between on-demand blocks")
+	require.Greater(t, leader.publishedStaleAfter(), 3*30*time.Second-time.Second, "published window covers the 30s backoff cap")
+	require.LessOrEqual(t, maxLag, int64(1))
+}
+
+// Regular chains are unaffected by the backoff: the streak resets on every
+// new head, so a 6s chain (nibiru-like, warm EMA) polls ~1-2 times per block.
+func TestHeadTracker_RegularChainPollsAboutOncePerBlock(t *testing.T) {
+	ctx := t.Context()
+	ssr := newTestSSR(t, ctx)
+	start := time.Unix(1_700_000_000, 0)
+	now := start
+	polls := 0
+	bt := 6 * time.Second
+	leader := newTestTracker(ssr, nil, headTrackerDeps{
+		now: func() time.Time { return now }, blockTime: func() time.Duration { return bt },
+		poll: func(context.Context, bool) (*headObservation, error) {
+			polls++
+			n := int64(now.Sub(start) / bt)
+			// Blocks become visible ~1s after their timestamp (propagation).
+			if now.Sub(start.Add(time.Duration(n)*bt)) < time.Second {
+				n--
+			}
+			return &headObservation{Number: 1000 + n, Timestamp: start.Add(time.Duration(n) * bt).Unix()}, nil
+		},
+	})
+	leader.leaseDeadlineNs.Store(start.Add(24 * time.Hour).UnixNano())
+	next := start
+	for now.Sub(start) < 10*time.Minute {
+		if !now.Before(next) {
+			w, err := leader.tick(ctx)
+			require.NoError(t, err)
+			next = now.Add(w)
+		}
+		now = now.Add(100 * time.Millisecond)
+	}
+	perBlock := float64(polls) / float64(10*time.Minute/bt)
+	t.Logf("6s chain: %.2f polls per block", perBlock)
+	require.LessOrEqual(t, perBlock, 2.2)
+}

@@ -158,6 +158,9 @@ type headTracker struct {
 	// rejections (poisoned-counter recovery).
 	regressStreak int
 	regressLast   int64
+	// staleStreak counts consecutive same-head polls past the expected next
+	// block (staleWait backoff); reset on every new head.
+	staleStreak int
 
 	// leaseDeadlineNs is the instant (unix ns, local clock) after which this
 	// replica can no longer prove it holds the lease: lastOk + 2·ttl/3. The
@@ -538,6 +541,7 @@ func (t *headTracker) lead(ctx context.Context, lease data.Lease, ttl time.Durat
 			rcancel()
 		}
 		t.prev = nil
+		t.staleStreak = 0
 		t.logger.Info().Msg("head tracker released leadership")
 	}()
 
@@ -783,6 +787,7 @@ func (t *headTracker) tick(ctx context.Context) (time.Duration, error) {
 		}
 	}
 	t.prev, t.prevAt = obs, now
+	t.staleStreak = 0
 	return sinceSent(t.newHeadWait(obs, now, bt), elapsed), nil
 }
 
@@ -900,22 +905,37 @@ func (t *headTracker) newHeadWait(obs *headObservation, now time.Time, bt time.D
 	return clampDuration(target.Sub(now), lo, bt+md)
 }
 
-// staleWait schedules the retry after an unchanged head: wait for the expected
-// next block if it is still ahead, else retry at a quarter block.
+// staleWait schedules the retry after an unchanged head. While the next
+// block is still expected (prev timestamp + block time + delay in the
+// future) it waits for it. Once that moment has passed, consecutive
+// same-head results back off exponentially instead of retrying at a fixed
+// quarter block: on-demand / irregular chains (redbelly ~one block per
+// minutes, nibiru, filecoin null rounds) otherwise burn hundreds of polls per
+// block, and a cold block time (EMA not warm: on-demand chains rarely
+// produce the samples it needs, and samples > 120s are rejected) made the
+// retry a flat 500ms.
+//
+//   warm EMA: base max(500ms, bt/4), doubling, capped at max(bt, min(4·bt, 60s))
+//   cold:     base 1s, doubling, capped at 30s
+//
+// The streak resets on every new head, so a regular chain is unaffected.
 func (t *headTracker) staleWait(obs *headObservation, now time.Time, bt time.Duration) time.Duration {
-	retry := max(common.MinHeadTrackerPollWait, bt/4)
 	if !t.aligned() {
 		return max(common.MinHeadTrackerPollWait, bt)
 	}
-	p := t.prev
-	if p == nil || p.Timestamp <= 0 {
-		return retry
+	if p := t.prev; p != nil && p.Timestamp > 0 {
+		target := time.Unix(p.Timestamp, 0).Add(bt + t.meanDelay())
+		if target.After(now) {
+			return clampDuration(target.Sub(now), common.MinHeadTrackerPollWait, bt)
+		}
 	}
-	target := time.Unix(p.Timestamp, 0).Add(bt + t.meanDelay())
-	if target.After(now) {
-		return clampDuration(target.Sub(now), common.MinHeadTrackerPollWait, bt)
+	base, ceiling := max(common.MinHeadTrackerPollWait, bt/4), max(bt, min(4*bt, time.Minute))
+	if t.blockTimeCold() {
+		base, ceiling = time.Second, 30*time.Second
 	}
-	return retry
+	wait := base << min(t.staleStreak, 16)
+	t.staleStreak++
+	return min(wait, ceiling)
 }
 
 // metricsLoop exports the head and the served lag once a second.
