@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,7 +17,9 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/erpc/erpc/blockstore"
 	"github.com/erpc/erpc/common"
+	"github.com/erpc/erpc/telemetry"
 	"github.com/erpc/erpc/util"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -52,6 +55,8 @@ type timedChain struct {
 	// errorBeyondHead makes eth_getLogs past this node's head an error
 	// instead of a silently short result.
 	errorBeyondHead atomic.Bool
+	// unsupportedLogs answers eth_getLogs with "method not found".
+	unsupportedLogs atomic.Bool
 }
 
 func (c *timedChain) resolveTag(ref string) int64 {
@@ -136,6 +141,18 @@ func (c *timedChain) serve(w http.ResponseWriter, r *http.Request) {
 	if c.failData.Load() && (req.Method == "eth_call" || req.Method == "eth_getLogs") {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"temporarily unavailable"}}`))
+		return
+	}
+	switch req.Method {
+	case "eth_getLogs":
+		if c.unsupportedLogs.Load() {
+			rpcErr = map[string]interface{}{"code": -32601, "message": "the method eth_getLogs does not exist/is not available"}
+		}
+	}
+	if rpcErr != nil {
+		resp := map[string]interface{}{"jsonrpc": "2.0", "id": req.Id, "error": rpcErr}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
 		return
 	}
 	switch req.Method {
@@ -826,4 +843,355 @@ func TestHeadTracker_E2E_ResponsesDoNotAdvanceUpstreamHead(t *testing.T) {
 	_, _, _ = reps[0].send(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{"fromBlock":"0x%x","toBlock":"0x%x"}]}`, before-2, future), nil, nil)
 	time.Sleep(200 * time.Millisecond)
 	require.Less(t, sp.LatestBlock(), future, "no response credited the upstream with the requested future height")
+}
+
+// fluxPriorityEval is the flux-latitude-oku PRIORITY_EVAL_FUNC (build.ts), with
+// PRIORITY_TAG="priority:" and UNTAGGED_PRIORITY=1000000 substituted.
+const fluxPriorityEval = `(upstreams, ctx) =>
+  upstreams
+    .removeCordoned()
+    .excludeIf(all(samplesAbove(10), errorRateAbove(0.7)))
+    .excludeIf(all(samplesAbove(10), throttleRateAbove(0.4)))
+    .excludeIf(any(all(samplesAbove(20), latencyAbove(3000), latencyDeviationAbove(3, { mode: 'majority' })), latencyAbove(10000)))
+    .excludeIf(any(blockNumberLagAbove(16), blockSecondsLagAbove(30)))
+    .whenEmpty(() => upstreams)
+    .sortByScore(PREFER_FASTEST)
+    .sortBy((u) => {
+      const tag = (u.tags || []).find((t) => t.indexOf('priority:') === 0);
+      const n = tag ? Number(tag.slice(9)) : NaN;
+      return isFinite(n) ? n : 1000000;
+    })
+    .probeExcluded({ sampleRate: 0.1, minSamples: 10, minSamplesWindow: '60s', maxConcurrent: 4, timeout: '10s' })
+`
+
+// priorityNet is one replica of a head-tracked network with 4 upstreams
+// (u0..u3, priority 1 / 1.2 / 1.25 / 1.7) on one timed chain, routed by the
+// flux priority policy, 60s state pollers and no response cache, so every
+// client request reaches an upstream.
+type priorityNet struct {
+	chain *timedChain
+	ups   []*timedChain
+	rep   htReplica
+	nw    *Network
+}
+
+func startPriorityNet(t *testing.T, blockTime time.Duration, evalScope common.EvalScope, scoreWindow time.Duration, setup func(ups []*timedChain)) *priorityNet {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	chain := newTimedChain(blockTime, 81_850_000)
+	t.Cleanup(chain.Close)
+	ups := []*timedChain{chain, chain.view(), chain.view(), chain.view()}
+	for _, u := range ups[1:] {
+		t.Cleanup(u.Close)
+	}
+	if setup != nil {
+		setup(ups)
+	}
+	prios := []string{"1", "1.2", "1.25", "1.7"}
+	cfg := headTrackerTestConfig(mr.Addr(), fmt.Sprintf("ht-prio-%d", time.Now().UnixNano()), chain.URL(),
+		&common.EvmHeadTrackerConfig{Enabled: true, LeaseTtl: common.Duration(2 * time.Second), FullBlocks: true}, false)
+	prj := cfg.Projects[0]
+	if scoreWindow > 0 {
+		prj.ScoreMetricsWindowSize = common.Duration(scoreWindow)
+	}
+	prj.Networks[0].SelectionPolicy = &common.SelectionPolicyConfig{
+		EvalFunc:     fluxPriorityEval,
+		EvalInterval: common.Duration(500 * time.Millisecond),
+		EvalScope:    evalScope,
+	}
+	base := prj.Upstreams[0]
+	prj.Upstreams = nil
+	for i, u := range ups {
+		c := *base
+		evmCfg := *base.Evm
+		c.Evm = &evmCfg
+		c.Id = fmt.Sprintf("u%d", i)
+		c.Endpoint = u.URL()
+		c.Tags = []string{"priority:" + prios[i]}
+		prj.Upstreams = append(prj.Upstreams, &c)
+	}
+	rep := startHTReplicas(t, 1, func() *common.Config { return cfg })[0]
+	require.Eventually(t, func() bool {
+		return trackerOf(t, rep).FreshHead() >= chain.head()-3
+	}, 15*time.Second, 20*time.Millisecond, "tracker follows the chain")
+	return &priorityNet{chain: chain, ups: ups, rep: rep, nw: rep.network(t)}
+}
+
+func (p *priorityNet) upstream(t *testing.T, i int) common.EvmUpstream {
+	for _, u := range p.nw.upstreamsRegistry.GetNetworkUpstreams(t.Context(), p.nw.networkId) {
+		if u.Id() == fmt.Sprintf("u%d", i) {
+			return u
+		}
+	}
+	t.Fatalf("u%d not found", i)
+	return nil
+}
+
+func probeCount(nw *Network, id string, methods ...string) float64 {
+	var s float64
+	for _, m := range methods {
+		s += testutil.ToFloat64(telemetry.MetricSelectionProbeRequests.WithLabelValues(nw.networkId, id, m))
+	}
+	return s
+}
+
+// upstreamCalls is every JSON-RPC call a node received, by method.
+func (c *timedChain) snapshot() map[string]int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]int, len(c.calls))
+	for k, v := range c.calls {
+		out[k] = v
+	}
+	return out
+}
+
+func callsDelta(before, after map[string]int) (map[string]int, int) {
+	d := map[string]int{}
+	total := 0
+	for k, v := range after {
+		if n := v - before[k]; n > 0 {
+			d[k] = n
+			total += n
+		}
+	}
+	return d, total
+}
+
+type fastChainResult struct {
+	reqs, fails, notLeader int
+	leaderPolls            int64
+	window                 time.Duration
+	blocks                 int64
+	perUpstream            [4]map[string]int
+	extra                  [4]int // calls other than u0's leader polls / client traffic
+	probes                 [4]float64
+}
+
+// runFastChainTraffic drives steady client eth_getBlockByNumber(n, true) and
+// eth_getLogs at the tracker head for `window`. u1's shared head is kept
+// current from the side (as other replicas' tip checks / its own
+// fresh-enough poller do in production), so the corroborated network head is
+// live while u2/u3's 60s poller views go stale: the dev-robinhood state that
+// put hundreds of blocks of apparent lag on the non-leader upstreams.
+func runFastChainTraffic(t *testing.T, legacy bool, window time.Duration) fastChainResult {
+	p := startPriorityNet(t, 100*time.Millisecond, common.EvalScopeNetwork, 0, nil)
+	if legacy {
+		// Pre-fix behavior: the selection policy reads the poller lag view.
+		p.nw.policyEngine.SetNetworkHooks(p.nw.networkId, nil)
+	}
+	u1 := p.upstream(t, 1)
+	stopSide := make(chan struct{})
+	sideDone := make(chan struct{})
+	go func() {
+		defer close(sideDone)
+		tk := time.NewTicker(200 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stopSide:
+				return
+			case <-tk.C:
+				u1.EvmStatePoller().SuggestLatestBlock(p.chain.head())
+			}
+		}
+	}()
+	defer func() { close(stopSide); <-sideDone }()
+	// Let u2/u3's poller views go stale (> 16 blocks / a few seconds) and a
+	// few policy ticks run.
+	time.Sleep(3 * time.Second)
+
+	methods := []string{"eth_getBlockByNumber", "eth_getLogs"}
+	var before [4]map[string]int
+	var probesBefore [4]float64
+	for i, u := range p.ups {
+		before[i] = u.snapshot()
+		probesBefore[i] = probeCount(p.nw, fmt.Sprintf("u%d", i), methods...)
+	}
+	startHead := p.chain.head()
+	startPolls := p.ups[0].latestCalls.Load()
+	var res fastChainResult
+	start := time.Now()
+	for time.Since(start) < window {
+		head := trackerOf(t, p.rep).FreshHead()
+		for _, q := range []struct{ m, params string }{
+			{"eth_getBlockByNumber", fmt.Sprintf(`["0x%x",true]`, head-2)},
+			{"eth_getLogs", fmt.Sprintf(`[{"fromBlock":"0x%x","toBlock":"0x%x"}]`, head-2, head)},
+		} {
+			res.reqs++
+			code, hdr, body := p.rep.send(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":%q,"params":%s}`, q.m, q.params), nil, nil)
+			var r rpcResp
+			_ = json.Unmarshal([]byte(body), &r)
+			if code != 200 || len(r.Error) > 0 || string(r.Result) == "null" {
+				res.fails++
+				if res.fails <= 3 {
+					t.Logf("%s failed: %d %s", q.m, code, body)
+				}
+				continue
+			}
+			if hdr["X-Erpc-Upstream"] != "u0" && hdr["X-ERPC-Upstream"] != "u0" {
+				res.notLeader++
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	res.window = time.Since(start)
+	res.blocks = p.chain.head() - startHead
+	res.leaderPolls = p.ups[0].latestCalls.Load() - startPolls
+	for i, u := range p.ups {
+		res.perUpstream[i], _ = callsDelta(before[i], u.snapshot())
+		res.probes[i] = probeCount(p.nw, fmt.Sprintf("u%d", i), methods...) - probesBefore[i]
+		if i > 0 {
+			for _, n := range res.perUpstream[i] {
+				res.extra[i] += n
+			}
+		}
+	}
+	mode := "fixed"
+	if legacy {
+		mode = "legacy"
+	}
+	totalExtra := res.extra[1] + res.extra[2] + res.extra[3]
+	t.Logf("[%s] %d requests over %s (%d blocks), %d failed, %d not served by u0; leader polls on u0: %d (%.2f/s); non-leader upstream calls: u1=%v u2=%v u3=%v (%.2f calls/s); probes u1..u3: %v",
+		mode, res.reqs, res.window.Round(time.Millisecond), res.blocks, res.fails, res.notLeader,
+		res.leaderPolls, float64(res.leaderPolls)/res.window.Seconds(),
+		res.perUpstream[1], res.perUpstream[2], res.perUpstream[3], float64(totalExtra)/res.window.Seconds(), res.probes[1:])
+	return res
+}
+
+func fastChainWindow() time.Duration {
+	if v := os.Getenv("ERPC_TEST_FASTCHAIN_WINDOW"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	if testing.Short() {
+		return 5 * time.Second
+	}
+	return 15 * time.Second
+}
+
+// Spec (head lag on demand): on a fast (0.1s) tracked chain whose non-leader
+// upstreams have ~stale poller views, steady tip traffic is served by the
+// leader-served upstream with NO extra upstream calls: no lag exclusion, no
+// shadow probes, no tip checks (nothing is routed past u0). The legacy run
+// (pre-fix policy view) is measured for comparison and must show the probe
+// fan-out the fix removes.
+func TestHeadTracker_E2E_FastChainNoProbeFanOut(t *testing.T) {
+	window := fastChainWindow()
+	var legacy fastChainResult
+	t.Run("legacy", func(t *testing.T) { legacy = runFastChainTraffic(t, true, window) })
+	var fixed fastChainResult
+	t.Run("fixed", func(t *testing.T) { fixed = runFastChainTraffic(t, false, window) })
+
+	legacyExtra := legacy.extra[1] + legacy.extra[2] + legacy.extra[3]
+	fixedExtra := fixed.extra[1] + fixed.extra[2] + fixed.extra[3]
+	t.Logf("extra non-leader upstream calls/s: before %.2f, after %.2f; shadow probes: before %.0f, after %.0f",
+		float64(legacyExtra)/legacy.window.Seconds(), float64(fixedExtra)/fixed.window.Seconds(),
+		legacy.probes[1]+legacy.probes[2]+legacy.probes[3], fixed.probes[1]+fixed.probes[2]+fixed.probes[3])
+
+	require.Positive(t, legacy.probes[2]+legacy.probes[3], "legacy: stale-lag exclusion mirrors client requests to u2/u3 (the regression this guards)")
+
+	require.Zero(t, fixed.fails, "requests succeed")
+	require.Zero(t, fixed.notLeader, "every request is served by the leader-served upstream u0")
+	for i := 1; i < 4; i++ {
+		require.Zero(t, fixed.probes[i], "u%d: zero shadow probes to a healthy upstream", i)
+		require.Zero(t, fixed.perUpstream[i]["eth_getBlockByNumber"]+fixed.perUpstream[i]["eth_getLogs"],
+			"u%d: no data calls (got %v)", i, fixed.perUpstream[i])
+		// Only possible background calls: one 60s poller tick (eth_getBlockByNumber
+		// latest/finalized + eth_syncing) and no tip checks (no traffic reaches it).
+		require.LessOrEqual(t, fixed.perUpstream[i]["eth_blockNumber"], 0, "u%d: no tip checks without traffic", i)
+	}
+	// Leader polls: the head tracker on u0, about one per 500ms floor.
+	require.LessOrEqual(t, float64(fixed.leaderPolls)/fixed.window.Seconds(), 3.0, "u0: leader polls stay ~2/s (500ms floor)")
+}
+
+// Spec: when the leader-served upstream cannot serve a tip request, exactly
+// the next upstream in priority order gets ONE eth_blockNumber tip check and
+// then the data request; no other upstream is contacted.
+func TestHeadTracker_E2E_FailoverTipChecksOnlyNextInLine(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(u0 *timedChain)
+	}{
+		{"unsupported", func(u0 *timedChain) { u0.unsupportedLogs.Store(true) }},
+		{"server-error", func(u0 *timedChain) { u0.failData.Store(true) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := startPriorityNet(t, 100*time.Millisecond, common.EvalScopeNetwork, 0, func(ups []*timedChain) { tc.setup(ups[0]) })
+			// u1..u3's 60s poller views are now well behind the chain; freeze
+			// the chain so the target block is deterministic.
+			time.Sleep(2 * time.Second)
+			p.chain.pinned.Store(p.chain.head())
+			pinned := p.chain.pinned.Load()
+			require.Eventually(t, func() bool { return trackerOf(t, p.rep).FreshHead() == pinned }, 5*time.Second, 10*time.Millisecond)
+			for i := 1; i < 4; i++ {
+				require.Less(t, p.upstream(t, i).EvmStatePoller().LatestBlock(), pinned-10, "u%d's known head is stale", i)
+			}
+			var before [4]map[string]int
+			for i, u := range p.ups {
+				before[i] = u.snapshot()
+			}
+			code, hdr, body := p.rep.send(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{"fromBlock":"0x%x","toBlock":"0x%x"}]}`, pinned-2, pinned), nil, nil)
+			var r rpcResp
+			require.NoError(t, json.Unmarshal([]byte(body), &r), body)
+			require.Equal(t, 200, code, body)
+			require.Empty(t, r.Error, body)
+			var logs []json.RawMessage
+			require.NoError(t, json.Unmarshal(r.Result, &logs))
+			require.Len(t, logs, 3, "full range served")
+			served := hdr["X-Erpc-Upstream"] + hdr["X-ERPC-Upstream"]
+			require.Equal(t, "u1", served, "served by the next upstream in priority order")
+
+			d0, _ := callsDelta(before[0], p.ups[0].snapshot())
+			d1, _ := callsDelta(before[1], p.ups[1].snapshot())
+			t.Logf("u0 %v, u1 %v", d0, d1)
+			require.Equal(t, 1, d0["eth_getLogs"], "u0 tried once")
+			require.Equal(t, 1, d1["eth_blockNumber"], "u1: exactly one tip check")
+			require.Equal(t, 1, d1["eth_getLogs"], "u1: then the data request")
+			for i := 2; i < 4; i++ {
+				d, n := callsDelta(before[i], p.ups[i].snapshot())
+				require.Zero(t, n, "u%d is not contacted (got %v)", i, d)
+			}
+		})
+	}
+}
+
+// Probing for re-admission still works on a tracked network: upstreams
+// excluded for errors get (sampled) probes, and a healed one is re-admitted
+// and serves again. Upstreams that were never excluded get no probes.
+func TestHeadTracker_E2E_ErrorExcludedUpstreamProbedAndReadmitted(t *testing.T) {
+	p := startPriorityNet(t, 100*time.Millisecond, common.EvalScopeNetworkMethod, 3*time.Second, func(ups []*timedChain) {
+		ups[0].failData.Store(true)
+		ups[1].failData.Store(true)
+	})
+	call := func() string {
+		code, hdr, body := p.rep.send(`{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0x0000000000000000000000000000000000000002","data":"0x"},"latest"]}`, nil, nil)
+		require.Equal(t, 200, code, body)
+		return hdr["X-Erpc-Upstream"] + hdr["X-ERPC-Upstream"]
+	}
+	excluded := func() []string {
+		var out []string
+		for _, u := range p.nw.policyEngine.GetExcluded(p.nw.networkId, "eth_call", "*") {
+			out = append(out, u.Id())
+		}
+		return out
+	}
+	require.Eventually(t, func() bool {
+		_ = call()
+		ex := excluded()
+		return len(ex) == 2
+	}, 20*time.Second, 20*time.Millisecond, "u0 and u1 are excluded for errors")
+	require.ElementsMatch(t, []string{"u0", "u1"}, excluded())
+	require.Equal(t, "u2", call())
+
+	probes1 := probeCount(p.nw, "u1", "eth_call")
+	probes3 := probeCount(p.nw, "u3", "eth_call")
+	p.ups[1].failData.Store(false)
+	require.Eventually(t, func() bool {
+		return call() == "u1"
+	}, 20*time.Second, 20*time.Millisecond, "healed u1 is re-admitted and serves eth_call again")
+	require.Greater(t, probeCount(p.nw, "u1", "eth_call"), probes1, "u1 was re-admitted via probes")
+	require.Zero(t, probeCount(p.nw, "u3", "eth_call")-probes3, "the never-excluded u3 is not probed")
+	require.Contains(t, excluded(), "u0", "u0 still failing, still excluded")
 }
