@@ -10,6 +10,7 @@ import (
 
 	"github.com/erpc/erpc/blockstore"
 	"github.com/erpc/erpc/common"
+	"github.com/erpc/erpc/internal/policy"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -38,6 +39,18 @@ func (nr *NetworksRegistry) initHeadTracker(network *Network, nwCfg *common.Netw
 		ht.OnHead(func(int64) { c.Kick() })
 	}
 	ht.Start(nr.appCtx)
+	if network.policyEngine != nil {
+		// While the tracker head is fresh, head lag is enforced per request
+		// by checkTipAvailability (one debounced eth_blockNumber to the
+		// upstream actually chosen, only when its known head is behind the
+		// target), so the selection policy must not exclude/reorder
+		// upstreams on the 60s state-poller lag view, nor shadow-probe
+		// upstreams excluded only for lag. Unmasked the moment the tracker
+		// goes stale.
+		network.policyEngine.SetNetworkHooks(network.networkId, &policy.NetworkHooks{
+			HeadLagOnDemand: func() bool { return network.EvmTrackedHead() > 0 },
+		})
+	}
 	return nil
 }
 

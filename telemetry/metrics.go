@@ -18,8 +18,8 @@ var (
 	MetricUpstreamRequestTotal = DefineLabeledCounter(prometheus.CounterOpts{
 		Namespace: "erpc",
 		Name:      "upstream_request_total",
-		Help:      "Total number of actual requests to upstreams.",
-	}, []string{"project", "vendor", "network", "upstream", "category", "attempt", "composite", "finality", "user", "agent_name"})
+		Help:      "Total number of actual requests to upstreams. `attempt` is the request's physical-operation count when this call started (upstream + cache operations, 1-based); it is NOT a retry ordinal, so do not read attempt!=\"0\" as a retry. `is_retry` is true when the call is a retry (upstream, network or cache retry rounds already happened for the request).",
+	}, []string{"project", "vendor", "network", "upstream", "category", "attempt", "composite", "finality", "user", "agent_name", "is_retry"})
 
 	MetricUpstreamErrorTotal = DefineLabeledCounter(prometheus.CounterOpts{
 		Namespace: "erpc",
