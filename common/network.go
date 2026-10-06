@@ -157,4 +157,3 @@ type TrackedMetrics interface {
 	ErrorRate() float64
 	GetResponseQuantiles() QuantileTracker
 }
-
