@@ -81,9 +81,15 @@ const (
 	headTrackerWarnEvery = time.Minute
 	// headTrackerGapSamples is how many recent liveness gaps staleAfter
 	// considers (the max of them).
-	headTrackerGapSamples = 16
+	headTrackerGapSamples = 64
 	// headTrackerMaxGap bounds a poll interval that counts as cadence.
 	headTrackerMaxGap = 5 * time.Minute
+	// headTrackerColdStale is the staleness window while neither a measured
+	// block time nor a published leader window is available.
+	headTrackerColdStale = time.Minute
+	// headTrackerClockSkew is the skew tolerated when judging the age of the
+	// first alive value a replica learns.
+	headTrackerClockSkew = 5 * time.Second
 	// headTrackerRecoverAfter is how many consecutive, mutually consistent
 	// polls below the regression tolerance it takes to accept a large
 	// rollback: the recovery path for a published head that was poisoned
@@ -174,10 +180,19 @@ type headTracker struct {
 	// alive is the leader's liveness counter: unix ms of its last successful
 	// poll, published whether or not the head moved (at most once per poll).
 	alive data.CounterInt64SharedVariable
+	// staleMs is the leader's own staleness window (ms), published so
+	// followers need neither a warm EMA nor history of their own.
+	staleMs data.CounterInt64SharedVariable
 	// lastFreshHead / lastFreshAtNs remember the last head served as fresh,
 	// the floor for the fallback path (S7).
 	lastFreshHead atomic.Int64
 	lastFreshAtNs atomic.Int64
+
+	// procMu serializes poll-result processing (polls themselves overlap).
+	procMu sync.Mutex
+
+	// balancer spreads leases across replicas (see headTrackerBalancer).
+	balancer *headTrackerBalancer
 
 	// checks / checkGroup back checkUpstreamHead (tip checks).
 	checks     sync.Map // upstream id -> *upstreamCheck
@@ -205,6 +220,7 @@ func newHeadTracker(projectId, networkId, label string, cfg *common.EvmHeadTrack
 		ssr:       ssr,
 		head:      ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTracker/"+scope, common.DefaultToleratedBlockHeadRollback),
 		alive:     ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTrackerAlive/"+scope, 0),
+		staleMs:   ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTrackerStaleMs/"+scope, 0),
 		leaseKey:  "headTracker/" + scope,
 		deps:      deps,
 		logger:    &lg,
@@ -228,15 +244,29 @@ func newHeadTracker(projectId, networkId, label string, cfg *common.EvmHeadTrack
 	})
 	t.alive.OnValue(func(v int64) {
 		prev := t.seenAlive.Swap(v)
-		if prev <= 0 || v == prev {
+		if v == prev {
 			return
 		}
-		t.advancedAtNs.Store(t.deps.now().UnixNano())
+		now := t.deps.now()
+		if prev <= 0 {
+			// First value this replica learns (startup, or a new counter
+			// after failover): its age is only knowable across clocks. Honor
+			// it when it is plausibly recent (within the staleness window,
+			// tolerating a few seconds of skew), so a starting follower does
+			// not wait up to a whole block interval of a slow chain before
+			// serving the tracker head.
+			if age := now.Sub(time.UnixMilli(v)); age > -headTrackerClockSkew && age <= t.staleAfter() {
+				t.advancedAtNs.Store(now.Add(-max(age, 0)).UnixNano())
+			}
+			return
+		}
+		t.advancedAtNs.Store(now.UnixNano())
 		// Both values were stamped by the leader's clock, so their
 		// difference is a pure duration (no cross-host skew): the leader's
 		// actual poll cadence.
 		t.noteLivenessGap(time.Duration(v-prev) * time.Millisecond)
 	})
+	t.staleMs.OnValue(func(int64) {})
 	return t
 }
 
@@ -271,7 +301,43 @@ func (t *headTracker) IsLeader() bool { return t != nil && t.isLeader.Load() }
 // the difference of two consecutive alive values, both stamped by the
 // leader's clock, so no clock skew enters.
 func (t *headTracker) staleAfter() time.Duration {
+	local := t.localStaleAfter()
+	if pub := time.Duration(t.staleMs.GetValue()) * time.Millisecond; pub > 0 {
+		// The leader's own window: computed from its WARM block-time EMA and
+		// its poll cadence, which a follower cannot know (its EMA is cold,
+		// only the leader sees block timestamps).
+		return max(local, pub)
+	}
+	// Nothing published yet (startup before the first leader poll): be
+	// conservative rather than fall back on the 5s floor.
+	return max(local, headTrackerColdStale)
+}
+
+// localStaleAfter is this replica's own estimate: max(3 × block time, 3 ×
+// the longest recent interval between successful leader polls,
+// headTrackerMinStale).
+func (t *headTracker) localStaleAfter() time.Duration {
 	return max(headTrackerStaleBlocks*t.blockTime(), headTrackerStaleBlocks*time.Duration(t.maxGapNs.Load()), headTrackerMinStale)
+}
+
+// publishedStaleAfter is the window the leader publishes: its local
+// estimate, or at least headTrackerColdStale while its own block time is
+// still the cold default (a fresh leader right after failover).
+func (t *headTracker) publishedStaleAfter() time.Duration {
+	d := t.localStaleAfter()
+	if t.blockTimeCold() {
+		d = max(d, headTrackerColdStale)
+	}
+	return d
+}
+
+// blockTimeCold reports that the cadence is still the cold-start default
+// (no measured EMA and no configured interval).
+func (t *headTracker) blockTimeCold() bool {
+	if t.cfg != nil && t.cfg.Interval != nil {
+		return false
+	}
+	return t.deps.blockTime == nil || t.deps.blockTime() <= 0
 }
 
 // noteLivenessGap records one interval between the leader's successful polls;
@@ -407,8 +473,26 @@ func (t *headTracker) Stop() {
 }
 
 func (t *headTracker) run(ctx context.Context) {
+	t.balancer = headTrackerBalancerFor(t.ssr)
+	t.balancer.register(ctx, t)
+	defer t.balancer.unregister(t)
+	deferredSince := time.Time{}
 	for ctx.Err() == nil {
 		ttl := t.leaseTtl()
+		// Balance: a replica at its share of leases gives others ttl to
+		// take a free lease first; past that it takes it anyway.
+		if t.balancer.shouldDefer() || (!deferredSince.IsZero() && time.Since(deferredSince) < ttl) {
+			if deferredSince.IsZero() {
+				deferredSince = time.Now()
+			}
+			if time.Since(deferredSince) < ttl {
+				if !sleepCtx(ctx, ttl/5) {
+					return
+				}
+				continue
+			}
+		}
+		deferredSince = time.Time{}
 		lease, err := t.ssr.AcquireLease(ctx, t.leaseKey, ttl)
 		if err != nil {
 			if errors.Is(err, data.ErrLeaseUnsupported) {
@@ -419,6 +503,12 @@ func (t *headTracker) run(ctx context.Context) {
 		}
 		if lease != nil {
 			t.lead(ctx, lease, ttl)
+			// Do not immediately re-acquire what was just released (handover,
+			// step-down): give other replicas a full TTL first.
+			deferredSince = time.Now()
+			if !sleepCtx(ctx, ttl/5) {
+				return
+			}
 			continue
 		}
 		// Follower: check again well within one TTL so takeover after a
@@ -489,22 +579,106 @@ func (t *headTracker) lead(ctx context.Context, lease data.Lease, ttl time.Durat
 		}
 	}()
 
-	failures := 0
-	for session.Err() == nil {
-		wait, err := t.tick(session)
-		if err != nil {
-			failures++
-			if session.Err() == nil {
-				t.logger.Debug().Err(err).Int("consecutiveFailures", failures).Msg("head tracker poll failed")
-			}
-			if failures >= headTrackerMaxPollFailures {
-				t.logger.Warn().Err(err).Int("consecutiveFailures", failures).Msg("head tracker leader stepping down after repeated poll failures")
+	// Hand over: while this replica leads more than its share, release this
+	// lease once it has been held for a while, but only one network at a time
+	// per process (handoverMu) so leadership moves gradually.
+	go func() {
+		tk := time.NewTicker(headTrackerHandoverCheck)
+		defer tk.Stop()
+		heldSince := time.Now()
+		for {
+			select {
+			case <-session.Done():
 				return
+			case <-tk.C:
 			}
-		} else {
-			failures = 0
+			if time.Since(heldSince) < headTrackerHandoverMinHold || !t.balancer.overShare() {
+				continue
+			}
+			if !handoverMu.TryLock() {
+				continue
+			}
+			t.logger.Info().Msg("head tracker handing over leadership to balance replicas")
+			// Released in lead's deferred cleanup; keep the process-wide
+			// handover slot until other replicas had a chance to take it.
+			go func() {
+				time.Sleep(2 * ttl)
+				handoverMu.Unlock()
+			}()
+			cancel()
+			return
 		}
+	}()
+	t.pollLoop(session)
+}
+
+// handoverMu allows one lease handover at a time per process.
+var handoverMu sync.Mutex
+
+const (
+	headTrackerHandoverCheck   = 10 * time.Second
+	headTrackerHandoverMinHold = 30 * time.Second
+)
+
+// headTrackerMaxInFlight bounds concurrent leader polls per network.
+const headTrackerMaxInFlight = 2
+
+// pollLoop schedules polls by the CLOCK, not by the previous poll's return:
+// the next poll fires at the scheduled time even if the previous one is still
+// running (at most headTrackerMaxInFlight in flight), so poll latency close to
+// the block time no longer caps the cadence at 1/(latency + wait). Each poll's
+// result is processed (tick) under procMu, so leader-local state stays
+// single-threaded; the cache/blockstore write and publish happen inside tick
+// (S1 ordering per block) but do not delay the next scheduled poll.
+func (t *headTracker) pollLoop(session context.Context) {
+	sem := make(chan struct{}, headTrackerMaxInFlight)
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	var failures atomic.Int32
+	nextAt := make(chan time.Duration, headTrackerMaxInFlight)
+	wait := time.Duration(0)
+	for session.Err() == nil {
 		if !sleepCtx(session, wait) {
+			return
+		}
+		select {
+		case sem <- struct{}{}:
+		case <-session.Done():
+			return
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			w, err := t.tick(session)
+			if err != nil {
+				n := failures.Add(1)
+				if session.Err() == nil {
+					t.logger.Debug().Err(err).Int32("consecutiveFailures", n).Msg("head tracker poll failed")
+				}
+			} else {
+				failures.Store(0)
+			}
+			select {
+			case nextAt <- w:
+			default:
+			}
+		}()
+		if failures.Load() >= headTrackerMaxPollFailures {
+			t.logger.Warn().Int32("consecutiveFailures", failures.Load()).Msg("head tracker leader stepping down after repeated poll failures")
+			return
+		}
+		// Next poll: as soon as a poll result proposes a time; if the poll
+		// is still running when one block time has passed, fire the next one
+		// anyway (bounded by the semaphore), so a slow poll never delays the
+		// schedule past the expected next block.
+		bt := t.blockTime()
+		select {
+		case w := <-nextAt:
+			wait = w
+		case <-time.After(max(bt, common.MinHeadTrackerPollWait)):
+			wait = 0
+		case <-session.Done():
 			return
 		}
 	}
@@ -518,12 +692,23 @@ func (t *headTracker) tick(ctx context.Context) (time.Duration, error) {
 
 	start := t.deps.now()
 	obs, err := t.deps.poll(ctx, full)
-	now := t.deps.now()
+	// Polls may overlap (pollLoop); everything below mutates leader-local
+	// state and must run one result at a time.
+	t.procMu.Lock()
+	defer t.procMu.Unlock()
+	end := t.deps.now()
+	// Schedule and propagation delay are measured from when the poll was
+	// SENT: the answer reflects the chain at that instant, and measuring from
+	// the response would fold the poll's own latency (CPU throttling, large
+	// fullBlocks payloads) into every wait, capping the cadence at
+	// 1/(latency + block time). The returned wait is then relative to `end`.
+	now := start
+	elapsed := end.Sub(start)
 	outcome := "ok"
 	if err != nil {
 		outcome = "error"
 	}
-	telemetry.MetricHeadTrackerPollDuration.WithLabelValues(t.projectId, t.label, outcome).Observe(now.Sub(start).Seconds())
+	telemetry.MetricHeadTrackerPollDuration.WithLabelValues(t.projectId, t.label, outcome).Observe(elapsed.Seconds())
 	if err != nil {
 		return retry, err
 	}
@@ -551,7 +736,7 @@ func (t *headTracker) tick(ctx context.Context) (time.Duration, error) {
 		// A slightly lagging upstream answered: the next block is not out
 		// yet. The poll succeeded and the published head is still correct.
 		t.publishAlive(ctx)
-		return t.staleWait(obs, now, bt), nil
+		return sinceSent(t.staleWait(obs, now, bt), elapsed), nil
 	}
 	if obs.Number == current {
 		t.publishAlive(ctx)
@@ -569,7 +754,7 @@ func (t *headTracker) tick(ctx context.Context) (time.Duration, error) {
 		} else if t.prev == nil {
 			t.prev, t.prevAt = obs, now
 		}
-		return t.staleWait(obs, now, bt), nil
+		return sinceSent(t.staleWait(obs, now, bt), elapsed), nil
 	}
 
 	// New head. Write the polled block to the cache / block store FIRST
@@ -598,7 +783,13 @@ func (t *headTracker) tick(ctx context.Context) (time.Duration, error) {
 		}
 	}
 	t.prev, t.prevAt = obs, now
-	return t.newHeadWait(obs, now, bt), nil
+	return sinceSent(t.newHeadWait(obs, now, bt), elapsed), nil
+}
+
+// sinceSent converts a wait measured from when a poll was sent into the
+// remaining wait after it returned (elapsed later).
+func sinceSent(wait, elapsed time.Duration) time.Duration {
+	return max(wait-elapsed, 0)
 }
 
 // recoverFromPoisonedHead decides whether a poll that "regresses" more than
@@ -883,5 +1074,12 @@ func (t *headTracker) publishAlive(ctx context.Context) {
 	// The leader knows its own poll succeeded: fresh locally at once (its
 	// first head may only seed the counter callbacks).
 	t.advancedAtNs.Store(now.UnixNano())
+	// Publish the leader's own staleness window first (followers apply it
+	// to the alive value that follows). Only on a >10% change, so steady
+	// state adds no writes.
+	sa := t.publishedStaleAfter().Milliseconds()
+	if pub := t.staleMs.GetValue(); pub <= 0 || sa > pub*11/10 || sa < pub*9/10 {
+		t.staleMs.TryUpdate(ctx, sa)
+	}
 	t.alive.TryUpdate(ctx, now.UnixMilli())
 }

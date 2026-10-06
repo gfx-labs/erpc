@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/erpc/erpc/common"
 	"github.com/erpc/erpc/data"
 	"github.com/rs/zerolog/log"
@@ -102,9 +103,10 @@ func TestHeadTracker_BlockTimeSource(t *testing.T) {
 	require.Equal(t, common.DefaultHeadTrackerColdInterval, ht.blockTime(), "cold start")
 	ema = 400 * time.Millisecond
 	require.Equal(t, ema, ht.blockTime(), "EMA by default")
-	require.Equal(t, headTrackerMinStale, ht.staleAfter())
+	require.Equal(t, headTrackerMinStale, ht.localStaleAfter())
+	require.Equal(t, headTrackerColdStale, ht.staleAfter(), "nothing published yet: conservative cold window")
 	ema = 12 * time.Second
-	require.Equal(t, 36*time.Second, ht.staleAfter(), "stale = 3 block times")
+	require.Equal(t, 36*time.Second, ht.localStaleAfter(), "stale = 3 block times")
 
 	ht = newTestTracker(ssr, &common.EvmHeadTrackerConfig{Enabled: true, Interval: &common.BlockTimeAdaptiveDuration{BlockTimeMultiplier: 0.5, Fallback: common.Duration(3 * time.Second)}},
 		headTrackerDeps{blockTime: func() time.Duration { return ema }})
@@ -210,11 +212,13 @@ func TestHeadTracker_FreshnessUsesLocalClock(t *testing.T) {
 	require.Equal(t, int64(101), ht.FreshHead())
 	// Local time moves past the staleness window with no advance: stale,
 	// whatever timestamps the shared counter carries.
-	now = now.Add(headTrackerMinStale + time.Second)
+	now = now.Add(ht.staleAfter() + time.Second)
 	require.Zero(t, ht.FreshHead())
-	// S7: the fallback floor is the last fresh head, for a bounded time.
+	// S7: the fallback floor is the last fresh head, for a bounded time
+	// measured from when it was last served fresh.
+	now = now.Add(-ht.staleAfter())
 	require.Equal(t, int64(101), ht.FallbackFloor())
-	now = now.Add(headTrackerFallbackFloorTTL)
+	now = now.Add(headTrackerFallbackFloorTTL + time.Second)
 	require.Zero(t, ht.FallbackFloor(), "the floor fails open after its TTL")
 }
 
@@ -521,4 +525,189 @@ func TestHeadTracker_DeadLeaderStillFallsBack(t *testing.T) {
 	// Leader dies: no more polls.
 	now = now.Add(37 * time.Second)
 	require.Zero(t, follower.FreshHead(), "stale after 3 × the 12s poll cadence")
+}
+
+// rc.3 lag: with poll latency close to the block time (CPU-throttled pods,
+// fullBlocks payloads) the leader used to poll once per (latency + wait),
+// i.e. far less than once per block. Cadence must stay ~1 poll per block.
+func TestHeadTracker_CadenceIndependentOfPollLatency(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		bt      time.Duration
+		latency time.Duration
+	}{
+		{"1s blocks, 0.9s polls", time.Second, 900 * time.Millisecond},
+		{"1s blocks, 1.5s polls", time.Second, 1500 * time.Millisecond},
+		{"monad-like 0.4s blocks, 0.9s polls", 400 * time.Millisecond, 900 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ssr := newTestSSR(t, ctx)
+			chain := &fakeChain{start: time.Now(), blockTime: tc.bt, base: 5000}
+			var inFlight, maxInFlight atomic.Int32
+			ht := newTestTracker(ssr, &common.EvmHeadTrackerConfig{Enabled: true, LeaseTtl: common.Duration(2 * time.Second)}, headTrackerDeps{
+				blockTime: func() time.Duration { return tc.bt },
+				poll: func(ctx context.Context, full bool) (*headObservation, error) {
+					c := inFlight.Add(1)
+					defer inFlight.Add(-1)
+					for {
+						m := maxInFlight.Load()
+						if c <= m || maxInFlight.CompareAndSwap(m, c) {
+							break
+						}
+					}
+					// The upstream answers with the head as of the request.
+					obs, err := chain.poll(ctx, full)
+					time.Sleep(tc.latency)
+					return obs, err
+				},
+			})
+			ht.Start(ctx)
+			defer ht.Stop()
+			require.Eventually(t, ht.IsLeader, 3*time.Second, 10*time.Millisecond)
+			window := 8 * time.Second
+			startCalls := chain.calls.Load()
+			time.Sleep(window)
+			perBlock := float64(chain.calls.Load()-startCalls) / (float64(window) / float64(tc.bt))
+			head, _ := chain.headAt(time.Now())
+			lag := head - ht.Head()
+			t.Logf("%s: %.2f polls per block, max in flight %d, head lag %d", tc.name, perBlock, maxInFlight.Load(), lag)
+			// Sub-second chains are floored at one poll per 500ms (and 2 in
+			// flight): the head still advances every poll by several blocks.
+			minPerBlock := min(0.85, float64(tc.bt)/float64(common.MinHeadTrackerPollWait)*0.85)
+			require.GreaterOrEqual(t, perBlock, minPerBlock, "about one poll per block (or per 500ms floor)")
+			require.LessOrEqual(t, perBlock, 2.0)
+			require.LessOrEqual(t, maxInFlight.Load(), int32(headTrackerMaxInFlight))
+			require.LessOrEqual(t, lag, int64(tc.latency/tc.bt)+3, "head stays within poll latency + ~1 poll")
+		})
+	}
+}
+
+// rc.3 follower windows: a follower that just started (or just went through
+// failover) on a 52s-block chain, whose leader also publishes alive on 13s
+// stale-result retries, must not fall back. Its own EMA is cold; it relies on
+// the window the leader publishes (and a conservative 60s floor before that).
+func TestHeadTracker_FollowerUsesPublishedWindowOnSlowChain(t *testing.T) {
+	ctx := t.Context()
+	ssr := newTestSSR(t, ctx)
+	start := time.Unix(1_700_000_000, 0)
+	now := start
+	clock := func() time.Time { return now }
+	bt := 52 * time.Second
+	leader := newTestTracker(ssr, nil, headTrackerDeps{
+		now: clock, blockTime: func() time.Duration { return bt },
+		poll: func(context.Context, bool) (*headObservation, error) {
+			n := 9000 + int64(now.Sub(start)/bt)
+			return &headObservation{Number: n, Timestamp: start.Add(time.Duration(n-9000) * bt).Unix()}, nil
+		},
+	})
+	leader.leaseDeadlineNs.Store(start.Add(24 * time.Hour).UnixNano())
+	var follower *headTracker
+	stale := 0
+	next := start
+	for now.Sub(start) < 10*time.Minute {
+		if !now.Before(next) {
+			// Leader polls every bt/4 (13s): stale-result retries between
+			// blocks, each publishing alive.
+			_, err := leader.tick(ctx)
+			require.NoError(t, err)
+			next = now.Add(bt / 4)
+		}
+		if follower == nil && now.Sub(start) >= 3*time.Minute {
+			// The follower starts mid-run (or after failover): fresh state.
+			follower = newTestTracker(ssr, nil, headTrackerDeps{now: clock, blockTime: func() time.Duration { return 0 }})
+			follower.seenAlive.Store(0)
+			follower.alive.OnValue(func(int64) {})
+		}
+		if follower != nil {
+			if follower.staleAfter() < 150*time.Second {
+				t.Fatalf("follower window %s at %s is too short for a 52s chain", follower.staleAfter(), now.Sub(start))
+			}
+		}
+		now = now.Add(time.Second)
+	}
+	_ = stale
+	require.GreaterOrEqual(t, leader.publishedStaleAfter(), 156*time.Second)
+}
+
+// Leases spread across replicas: 3 replicas × 6 networks end up ~2 each
+// instead of one replica leading all 6 (rc.3: all 31 on one pod).
+func TestHeadTracker_LeasesSpreadAcrossReplicas(t *testing.T) {
+	mr := miniredis.RunT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		tk := time.NewTicker(50 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tk.C:
+				mr.FastForward(50 * time.Millisecond)
+			}
+		}
+	}()
+	mkSSR := func(id string) data.SharedStateRegistry {
+		t.Setenv("INSTANCE_ID", id)
+		rc := &common.RedisConnectorConfig{Addr: mr.Addr(), ConnPoolSize: 4}
+		require.NoError(t, rc.SetDefaults())
+		r, err := data.NewSharedStateRegistry(ctx, &log.Logger, &common.SharedStateConfig{
+			ClusterKey: "spread", Connector: &common.ConnectorConfig{Id: id, Driver: common.DriverRedis, Redis: rc},
+		})
+		require.NoError(t, err)
+		return r
+	}
+	const replicas, networks = 3, 6
+	var all [replicas][]*headTracker
+	for r := 0; r < replicas; r++ {
+		ssr := mkSSR(fmt.Sprintf("pod-%d", r))
+		for n := 0; n < networks; n++ {
+			chain := &fakeChain{start: time.Now(), blockTime: time.Second, base: 100}
+			ht := newHeadTracker("p", fmt.Sprintf("evm:%d", n), fmt.Sprintf("n%d", n),
+				&common.EvmHeadTrackerConfig{Enabled: true, LeaseTtl: common.Duration(time.Second)}, ssr,
+				headTrackerDeps{blockTime: func() time.Duration { return time.Second }, poll: chain.poll}, &log.Logger)
+			all[r] = append(all[r], ht)
+		}
+		// Replica 0 boots first and would otherwise take every lease.
+		for _, ht := range all[r] {
+			ht.Start(ctx)
+		}
+		if r == 0 {
+			time.Sleep(2 * time.Second)
+		}
+	}
+	defer func() {
+		for r := range all {
+			for _, ht := range all[r] {
+				ht.Stop()
+			}
+		}
+	}()
+	counts := func() (c [replicas]int, total int) {
+		for r := range all {
+			for _, ht := range all[r] {
+				if ht.IsLeader() {
+					c[r]++
+					total++
+				}
+			}
+		}
+		return
+	}
+	require.Eventually(t, func() bool {
+		c, total := counts()
+		if total != networks {
+			return false
+		}
+		for _, n := range c {
+			if n > (networks+replicas-1)/replicas {
+				return false
+			}
+		}
+		return true
+	}, 3*time.Minute, 200*time.Millisecond, "leases spread to <= ceil(N/replicas) per replica")
+	c, _ := counts()
+	t.Logf("leases per replica: %v", c)
 }

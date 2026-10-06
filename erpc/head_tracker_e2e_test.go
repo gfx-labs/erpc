@@ -781,7 +781,7 @@ func TestHeadTracker_E2E_RedisOutageFallsBackWithoutPolling(t *testing.T) {
 			}
 		}
 		return true
-	}, 15*time.Second, 50*time.Millisecond, "no leader and every replica in fallback")
+	}, 90*time.Second, 100*time.Millisecond, "no leader and every replica in fallback (within the published window)")
 
 	// Client eth_blockNumber requests go upstream in fallback (as without the
 	// tracker), so count only background head polls: getBlockByNumber(latest).

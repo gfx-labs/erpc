@@ -185,3 +185,32 @@ func (l *memoryLease) Release(context.Context) error {
 	}
 	return nil
 }
+
+// HeartbeatReplicas records this instance as alive for ttl and returns how
+// many instances of the cluster are currently alive (including this one).
+// Redis: a sorted set scored by expiry. Memory (single process): 1. Other
+// drivers: ErrLeaseUnsupported.
+func (r *sharedStateRegistry) HeartbeatReplicas(ctx context.Context, ttl time.Duration) (int, error) {
+	switch c := unwrapConnector(r.connector).(type) {
+	case *RedisConnector:
+		client := c.Client()
+		if client == nil {
+			return 0, fmt.Errorf("replica heartbeat: redis not connected")
+		}
+		const script = `redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[3])
+redis.call('PEXPIRE', KEYS[1], ARGV[4])
+return redis.call('ZCARD', KEYS[1])`
+		now := time.Now()
+		n, err := client.Eval(ctx, script, []string{fmt.Sprintf("%s/replicas", r.clusterKey)},
+			r.instanceId, now.Add(ttl).UnixMilli(), now.UnixMilli(), (2 * ttl).Milliseconds()).Int()
+		if err != nil {
+			return 0, fmt.Errorf("replica heartbeat: %w", err)
+		}
+		return n, nil
+	case *MemoryConnector:
+		return 1, nil
+	default:
+		return 0, ErrLeaseUnsupported
+	}
+}
