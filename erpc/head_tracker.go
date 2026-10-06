@@ -154,6 +154,9 @@ type headTracker struct {
 	prev   *headObservation
 	prevAt time.Time
 	delays []time.Duration
+	// visTimes are the estimated wall-clock moments the recent new heads
+	// became visible to the leader (last = current head). See noteVisible.
+	visTimes []time.Time
 	// regressStreak / regressLast track consecutive consistent regression
 	// rejections (poisoned-counter recovery).
 	regressStreak int
@@ -186,6 +189,16 @@ type headTracker struct {
 	// staleMs is the leader's own staleness window (ms), published so
 	// followers need neither a warm EMA nor history of their own.
 	staleMs data.CounterInt64SharedVariable
+	// blockTimeMs is the leader's measured block time (ms), published so a
+	// replica whose own EMA is still cold (fresh pod after a deploy, new
+	// leader after failover) starts from the fleet's measured cadence
+	// instead of the 1s cold default. The value persists in shared state
+	// across deploys.
+	blockTimeMs data.CounterInt64SharedVariable
+	// quickBtNs is the leader's own block time from its last two distinct
+	// heads (on-chain timestamp delta / number delta): available after the
+	// second head, long before the EMA (which needs 4 observations) warms.
+	quickBtNs atomic.Int64
 	// lastFreshHead / lastFreshAtNs remember the last head served as fresh,
 	// the floor for the fallback path (S7).
 	lastFreshHead atomic.Int64
@@ -216,17 +229,18 @@ func newHeadTracker(projectId, networkId, label string, cfg *common.EvmHeadTrack
 	lg := logger.With().Str("component", "headTracker").Logger()
 	scope := projectId + "/" + networkId
 	t := &headTracker{
-		projectId: projectId,
-		networkId: networkId,
-		label:     label,
-		cfg:       cfg,
-		ssr:       ssr,
-		head:      ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTracker/"+scope, common.DefaultToleratedBlockHeadRollback),
-		alive:     ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTrackerAlive/"+scope, 0),
-		staleMs:   ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTrackerStaleMs/"+scope, 0),
-		leaseKey:  "headTracker/" + scope,
-		deps:      deps,
-		logger:    &lg,
+		projectId:   projectId,
+		networkId:   networkId,
+		label:       label,
+		cfg:         cfg,
+		ssr:         ssr,
+		head:        ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTracker/"+scope, common.DefaultToleratedBlockHeadRollback),
+		alive:       ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTrackerAlive/"+scope, 0),
+		staleMs:     ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTrackerStaleMs/"+scope, 0),
+		blockTimeMs: ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTrackerBlockTimeMs/"+scope, 0),
+		leaseKey:    "headTracker/" + scope,
+		deps:        deps,
+		logger:      &lg,
 	}
 	// Freshness is LIVENESS of the leader, not chain progress. The leader
 	// publishes a monotonic "alive" counter after every successful poll
@@ -270,6 +284,7 @@ func newHeadTracker(projectId, networkId, label string, cfg *common.EvmHeadTrack
 		t.noteLivenessGap(time.Duration(v-prev) * time.Millisecond)
 	})
 	t.staleMs.OnValue(func(int64) {})
+	t.blockTimeMs.OnValue(func(int64) {})
 	return t
 }
 
@@ -335,12 +350,54 @@ func (t *headTracker) publishedStaleAfter() time.Duration {
 }
 
 // blockTimeCold reports that the cadence is still the cold-start default
-// (no measured EMA and no configured interval).
+// (no measured or published block time and no configured interval).
 func (t *headTracker) blockTimeCold() bool {
 	if t.cfg != nil && t.cfg.Interval != nil {
 		return false
 	}
-	return t.deps.blockTime == nil || t.deps.blockTime() <= 0
+	return t.measuredBlockTime() <= 0
+}
+
+// headTrackerMaxSeedBlockTime bounds the seeds (published, quick estimate)
+// like the EMA bounds itself: an interval above it is an on-demand gap, not
+// a cadence, and is left to the cold backoff.
+const headTrackerMaxSeedBlockTime = 120 * time.Second
+
+// measuredBlockTime is the best block time known without a configured
+// override, 0 when none: this replica's EMA, else the block time the leader
+// published (persisted in shared state, so a fresh pod after a deploy uses
+// the previous leader's warm value at once), else the leader's own estimate
+// from its last two distinct heads.
+func (t *headTracker) measuredBlockTime() time.Duration {
+	if t.deps.blockTime != nil {
+		if ema := t.deps.blockTime(); ema > 0 {
+			return ema
+		}
+	}
+	if pub := time.Duration(t.blockTimeMs.GetValue()) * time.Millisecond; pub > 0 && pub <= headTrackerMaxSeedBlockTime {
+		return pub
+	}
+	return time.Duration(t.quickBtNs.Load())
+}
+
+// noteQuickBlockTime records the on-chain block time between two distinct
+// heads polled by this leader. Zero or negative deltas (same-second blocks,
+// out-of-order answers) carry no rate and are skipped.
+func (t *headTracker) noteQuickBlockTime(prev, obs *headObservation) {
+	if prev == nil || prev.Timestamp <= 0 || obs.Timestamp <= prev.Timestamp || obs.Number <= prev.Number {
+		return
+	}
+	bt := time.Duration(obs.Timestamp-prev.Timestamp) * time.Second / time.Duration(obs.Number-prev.Number)
+	// Bounded by the stale backoff cap: two gaps of an on-demand chain
+	// (minutes apart) are no cadence, and its cold backoff serves it better.
+	if bt < 10*time.Millisecond || bt > headTrackerMaxStaleBackoff {
+		return
+	}
+	if q := time.Duration(t.quickBtNs.Load()); q > 0 {
+		// Smooth: whole-second timestamps make single samples coarse.
+		bt = (q + bt) / 2
+	}
+	t.quickBtNs.Store(int64(bt))
 }
 
 // noteLivenessGap records one interval between the leader's successful polls;
@@ -420,19 +477,17 @@ func (t *headTracker) FreshHead() int64 {
 }
 
 // blockTime is the poll cadence basis: the configured interval override, else
-// the measured EMA, else the cold-start default.
+// the measured block time (EMA, published, quick estimate), else the
+// cold-start default.
 func (t *headTracker) blockTime() time.Duration {
-	var ema time.Duration
-	if t.deps.blockTime != nil {
-		ema = t.deps.blockTime()
-	}
+	measured := t.measuredBlockTime()
 	if t.cfg != nil && t.cfg.Interval != nil {
-		if d := t.cfg.Interval.Resolve(ema, common.DefaultHeadTrackerColdInterval); d > 0 {
+		if d := t.cfg.Interval.Resolve(measured, common.DefaultHeadTrackerColdInterval); d > 0 {
 			return d
 		}
 	}
-	if ema > 0 {
-		return ema
+	if measured > 0 {
+		return measured
 	}
 	return common.DefaultHeadTrackerColdInterval
 }
@@ -634,12 +689,24 @@ const headTrackerMaxInFlight = 2
 // result is processed (tick) under procMu, so leader-local state stays
 // single-threaded; the cache/blockstore write and publish happen inside tick
 // (S1 ordering per block) but do not delay the next scheduled poll.
+//
+// Only the most recently launched poll schedules the next one. A poll that
+// was overtaken (the loop already fired the next one because it ran past a
+// block time) still has its result processed, but its proposed wait is
+// discarded: it was computed from an older view. Before rc.6 every result
+// was queued and consumed in order, so a single slow poll left one surplus
+// result in the queue forever, and from then on each poll was paced by its
+// predecessor's (stale) proposal: a second, permanently offset schedule that
+// fired early, eroded the propagation-delay estimate and raised a 1-2s chain
+// from ~1.0 to 1.3-1.8 polls per block (staging rc.5: hyperevm, plasma,
+// pharos, base family).
 func (t *headTracker) pollLoop(session context.Context) {
 	sem := make(chan struct{}, headTrackerMaxInFlight)
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	var failures atomic.Int32
-	nextAt := make(chan time.Duration, headTrackerMaxInFlight)
+	results := make(chan headTrackerPollResult, headTrackerMaxInFlight+1)
+	var seq uint64
 	wait := time.Duration(0)
 	for session.Err() == nil {
 		if !sleepCtx(session, wait) {
@@ -650,6 +717,8 @@ func (t *headTracker) pollLoop(session context.Context) {
 		case <-session.Done():
 			return
 		}
+		seq++
+		mine := seq
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -664,7 +733,7 @@ func (t *headTracker) pollLoop(session context.Context) {
 				failures.Store(0)
 			}
 			select {
-			case nextAt <- w:
+			case results <- headTrackerPollResult{seq: mine, wait: w}:
 			default:
 			}
 		}()
@@ -676,14 +745,36 @@ func (t *headTracker) pollLoop(session context.Context) {
 		// is still running when one block time has passed, fire the next one
 		// anyway (bounded by the semaphore), so a slow poll never delays the
 		// schedule past the expected next block.
-		bt := t.blockTime()
-		select {
-		case w := <-nextAt:
-			wait = w
-		case <-time.After(max(bt, common.MinHeadTrackerPollWait)):
-			wait = 0
-		case <-session.Done():
+		if wait = awaitPollResult(session, results, mine, max(t.blockTime(), common.MinHeadTrackerPollWait)); wait < 0 {
 			return
+		}
+	}
+}
+
+// headTrackerPollResult is one finished poll's proposed wait, tagged with
+// the poll's launch sequence number.
+type headTrackerPollResult struct {
+	seq  uint64
+	wait time.Duration
+}
+
+// awaitPollResult waits for the result of poll `mine` and returns its
+// proposed wait, discarding results of older (overtaken) polls; 0 when the
+// poll is still running after `timeout`; -1 when the session ended.
+func awaitPollResult(session context.Context, results <-chan headTrackerPollResult, mine uint64, timeout time.Duration) time.Duration {
+	tm := time.NewTimer(timeout)
+	defer tm.Stop()
+	for {
+		select {
+		case r := <-results:
+			if r.seq < mine {
+				continue
+			}
+			return r.wait
+		case <-tm.C:
+			return 0
+		case <-session.Done():
+			return -1
 		}
 	}
 }
@@ -786,6 +877,8 @@ func (t *headTracker) tick(ctx context.Context) (time.Duration, error) {
 			telemetry.MetricHeadTrackerPropagationDelay.WithLabelValues(t.projectId, t.label).Observe(delay.Seconds())
 		}
 	}
+	t.noteQuickBlockTime(t.prev, obs)
+	t.noteVisible(t.prev, obs, now, bt)
 	t.prev, t.prevAt = obs, now
 	t.staleStreak = 0
 	return sinceSent(t.newHeadWait(obs, now, bt), elapsed), nil
@@ -892,13 +985,89 @@ func (t *headTracker) meanDelay() time.Duration {
 	return sum / time.Duration(len(t.delays))
 }
 
-// newHeadWait schedules the poll after a new head: at the expected timestamp
-// of the next block plus the mean propagation delay, never sooner than half a
-// block (or the floor) and never later than one block plus that delay.
+// headTrackerMinCadenceSamples is how many visibility intervals the
+// wall-clock cadence needs before it drives the schedule (until then the
+// on-chain timestamp + propagation delay schedule does).
+const headTrackerMinCadenceSamples = 4
+
+// headTrackerMaxStaleBackoff caps the same-head backoff (staleWait).
+const headTrackerMaxStaleBackoff = 30 * time.Second
+
+// noteVisible records when a new head became visible to the leader, on the
+// leader's wall clock, as an UPPER BOUND: the send time of the poll that
+// found it. One sample per distinct head; an interval longer than 4 block
+// times (a leader hiccup, an on-demand gap) is not cadence and restarts the
+// window.
+//
+// The schedule aims each poll cadenceLead before (last bound + cadence).
+// A hit there tightens the bound by the lead; a miss means the bound was
+// already within the lead of the real moment, and the retry (one stale
+// wait, >= MinHeadTrackerPollWait) lands after it. So the bound stays
+// within one retry of the real visibility moment and a miss costs one poll
+// every ~retry/lead heads (~1 extra poll per 20 heads: 500ms / 25ms on a
+// 2s cadence, 1.5s / 75ms on a 6s one).
+//
+// WHY wall clock. What the schedule must predict is when the NEXT head is
+// visible to the leader, and that is not always on-chain timestamp + block
+// time + delay. Nibiru's RPC exposes heads in steps of 1-2 blocks every
+// ~2.0s of wall clock while block timestamps alternate 1s/2s and the
+// observed delay swings 2.5-4.5s: a timestamp-anchored target lands before
+// the step about half the time (staging rc.5: 1.71 polls per block, 1.11
+// polls/s for one visible head per ~2s), while the wall-clock cadence is
+// regular to a few tens of ms. On a regular chain both give the same
+// answer (cadence = block time).
+func (t *headTracker) noteVisible(prev, obs *headObservation, sent time.Time, bt time.Duration) {
+	v := sent
+	if n := len(t.visTimes); prev == nil || n == 0 || v.Sub(t.visTimes[n-1]) <= 0 || v.Sub(t.visTimes[n-1]) > 4*max(bt, time.Second) {
+		t.visTimes = t.visTimes[:0]
+	}
+	t.visTimes = append(t.visTimes, v)
+	if len(t.visTimes) > headTrackerDelaySamples+1 {
+		t.visTimes = t.visTimes[1:]
+	}
+}
+
+// visibleCadence is the mean wall-clock interval between visible heads over
+// the window: (last - first) / intervals. The sum telescopes, so the error
+// of each bound (at most one retry late) cancels except at the two ends:
+// <= retry / window, well under cadenceLead once the window is full.
+// 0 until headTrackerMinCadenceSamples intervals.
+func (t *headTracker) visibleCadence() time.Duration {
+	n := len(t.visTimes) - 1
+	if n < headTrackerMinCadenceSamples {
+		return 0
+	}
+	return t.visTimes[n].Sub(t.visTimes[0]) / time.Duration(n)
+}
+
+// visibleAt is the estimated moment the current head became visible.
+func (t *headTracker) visibleAt() time.Time {
+	if n := len(t.visTimes); n > 0 {
+		return t.visTimes[n-1]
+	}
+	return t.prevAt
+}
+
+// cadenceLead is how much earlier than one cadence after the last hit the
+// next poll is sent. Aiming exactly one cadence after a hit that was found
+// late would stay late forever; leading lets the bound slide earlier until
+// a miss shows it reached the real moment.
+func cadenceLead(c time.Duration) time.Duration {
+	return max(c/80, 25*time.Millisecond)
+}
+
+// newHeadWait schedules the poll after a new head. With a measured
+// wall-clock cadence: one cadence (minus cadenceLead) after this head
+// became visible. Until then: at the expected timestamp of the next block
+// plus the mean propagation delay, never later than one block plus that
+// delay. Never sooner than half a block (or the floor).
 func (t *headTracker) newHeadWait(obs *headObservation, now time.Time, bt time.Duration) time.Duration {
 	lo := max(common.MinHeadTrackerPollWait, bt/2)
 	if !t.aligned() || obs.Timestamp <= 0 {
 		return max(common.MinHeadTrackerPollWait, bt)
+	}
+	if c := t.visibleCadence(); c > 0 {
+		return clampDuration(t.visibleAt().Add(c-cadenceLead(c)).Sub(now), lo, c)
 	}
 	md := t.meanDelay()
 	target := time.Unix(obs.Timestamp, 0).Add(bt + md)
@@ -915,23 +1084,32 @@ func (t *headTracker) newHeadWait(obs *headObservation, now time.Time, bt time.D
 // produce the samples it needs, and samples > 120s are rejected) made the
 // retry a flat 500ms.
 //
-//	warm EMA: base max(500ms, bt/4), doubling, capped at max(bt, min(4·bt, 60s))
-//	cold:     base 1s, doubling, capped at 30s
+//	warm: base max(500ms, bt/4), doubling, capped at min(4·bt, 30s)
+//	cold: base 1s, doubling, capped at 30s
+//
+// The 30s cap bounds how late an on-demand chain's next block is seen; a
+// warm block time on such a chain (the leader's quick estimate from two
+// 60-120s gaps) must not stretch it to minutes.
 //
 // The streak resets on every new head, so a regular chain is unaffected.
 func (t *headTracker) staleWait(obs *headObservation, now time.Time, bt time.Duration) time.Duration {
 	if !t.aligned() {
 		return max(common.MinHeadTrackerPollWait, bt)
 	}
-	if p := t.prev; p != nil && p.Timestamp > 0 {
+	if c := t.visibleCadence(); c > 0 && t.prev != nil {
+		target := t.visibleAt().Add(c - cadenceLead(c))
+		if target.After(now) {
+			return clampDuration(target.Sub(now), common.MinHeadTrackerPollWait, c)
+		}
+	} else if p := t.prev; p != nil && p.Timestamp > 0 {
 		target := time.Unix(p.Timestamp, 0).Add(bt + t.meanDelay())
 		if target.After(now) {
 			return clampDuration(target.Sub(now), common.MinHeadTrackerPollWait, bt)
 		}
 	}
-	base, ceiling := max(common.MinHeadTrackerPollWait, bt/4), max(bt, min(4*bt, time.Minute))
+	base, ceiling := max(common.MinHeadTrackerPollWait, bt/4), max(common.MinHeadTrackerPollWait, min(4*bt, headTrackerMaxStaleBackoff))
 	if t.blockTimeCold() {
-		base, ceiling = time.Second, 30*time.Second
+		base, ceiling = time.Second, headTrackerMaxStaleBackoff
 	}
 	wait := base << min(t.staleStreak, 16)
 	t.staleStreak++
@@ -1101,5 +1279,23 @@ func (t *headTracker) publishAlive(ctx context.Context) {
 	if pub := t.staleMs.GetValue(); pub <= 0 || sa > pub*11/10 || sa < pub*9/10 {
 		t.staleMs.TryUpdate(ctx, sa)
 	}
+	// Publish the leader's OWN block-time measurement (EMA, else the quick
+	// estimate), never an echo of the published value, on a >10% change.
+	if own := t.ownBlockTime().Milliseconds(); own > 0 {
+		if pub := t.blockTimeMs.GetValue(); pub <= 0 || own > pub*11/10 || own < pub*9/10 {
+			t.blockTimeMs.TryUpdate(ctx, own)
+		}
+	}
 	t.alive.TryUpdate(ctx, now.UnixMilli())
+}
+
+// ownBlockTime is this replica's own block-time measurement: its EMA, else
+// the leader's quick estimate from its last two distinct heads, else 0.
+func (t *headTracker) ownBlockTime() time.Duration {
+	if t.deps.blockTime != nil {
+		if ema := t.deps.blockTime(); ema > 0 && ema <= headTrackerMaxSeedBlockTime {
+			return ema
+		}
+	}
+	return time.Duration(t.quickBtNs.Load())
 }
