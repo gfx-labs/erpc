@@ -39,6 +39,11 @@ type SharedStateRegistry interface {
 	GetCounterInt64(key string, ignoreRollbackOf int64) CounterInt64SharedVariable
 	GetLockTtl() time.Duration
 	GetFallbackTimeout() time.Duration
+	// AcquireLease tries once to take the exclusive, expiring lease named key.
+	// (nil, nil) means another instance holds it. See Lease.
+	AcquireLease(ctx context.Context, key string, ttl time.Duration) (Lease, error)
+	// InstanceId identifies this instance in shared state (pod name or host).
+	InstanceId() string
 }
 
 type sharedStateRegistry struct {
@@ -271,4 +276,8 @@ func (r *sharedStateRegistry) GetLockTtl() time.Duration {
 
 func (r *sharedStateRegistry) GetFallbackTimeout() time.Duration {
 	return r.fallbackTimeout
+}
+
+func (r *sharedStateRegistry) InstanceId() string {
+	return r.instanceId
 }
