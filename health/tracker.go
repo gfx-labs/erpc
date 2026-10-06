@@ -1612,6 +1612,19 @@ func (t *Tracker) updateBlockTimeSample(ntwMeta *NetworkMetadata, netLabel strin
 	).Set(float64(time.Duration(blockTimeNs).Milliseconds()))
 }
 
+// ObserveNetworkHead feeds a network-level head observation (block number and
+// its on-chain timestamp, unix seconds) straight into the block-time EMA, as
+// the fleet head tracker does once per block. It touches neither per-upstream
+// heads nor lag: those stay owned by the state pollers. Out-of-order or
+// duplicate samples are rejected by updateBlockTimeSample itself.
+func (t *Tracker) ObserveNetworkHead(networkId, networkLabel string, blockNumber, blockTimestamp int64) {
+	if blockNumber <= 0 || blockTimestamp <= 0 {
+		return
+	}
+	ntwMeta := t.getMetadata(metadataKey{nil, networkId})
+	t.updateBlockTimeSample(ntwMeta, networkLabel, blockNumber, blockTimestamp)
+}
+
 // GetNetworkBlockTime returns the EMA-estimated block time for a network.
 // Returns 0 until at least blockTimeMinSamples have been collected.
 func (t *Tracker) GetNetworkBlockTime(networkId string) time.Duration {
