@@ -915,8 +915,8 @@ func (t *headTracker) newHeadWait(obs *headObservation, now time.Time, bt time.D
 // produce the samples it needs, and samples > 120s are rejected) made the
 // retry a flat 500ms.
 //
-//   warm EMA: base max(500ms, bt/4), doubling, capped at max(bt, min(4·bt, 60s))
-//   cold:     base 1s, doubling, capped at 30s
+//	warm EMA: base max(500ms, bt/4), doubling, capped at max(bt, min(4·bt, 60s))
+//	cold:     base 1s, doubling, capped at 30s
 //
 // The streak resets on every new head, so a regular chain is unaffected.
 func (t *headTracker) staleWait(obs *headObservation, now time.Time, bt time.Duration) time.Duration {
