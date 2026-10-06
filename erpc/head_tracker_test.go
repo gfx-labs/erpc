@@ -427,3 +427,98 @@ func TestHeadTracker_ElectionAndFailover(t *testing.T) {
 		return true
 	}, 3*time.Second, 10*time.Millisecond, "head keeps advancing after failover (within ~TTL + 1 block)")
 }
+
+// rc.2 dev flapping: on slow / irregular chains the head legitimately stops
+// moving while every leader poll succeeds. Followers must stay fresh.
+// Simulated on a virtual clock with two replicas sharing state: the leader
+// polls on its own cadence (real block time), the follower's block-time EMA
+// is cold (1s, as on lat-dev where only the leader sees block timestamps).
+func runSlowChainFreshness(t *testing.T, leaderBt time.Duration, headAt func(elapsed time.Duration) int64, total time.Duration) (staleSeconds int) {
+	ctx := t.Context()
+	ssr := newTestSSR(t, ctx)
+	start := time.Unix(1_700_000_000, 0)
+	now := start
+	clock := func() time.Time { return now }
+	leader := newTestTracker(ssr, nil, headTrackerDeps{
+		now:       clock,
+		blockTime: func() time.Duration { return leaderBt },
+		poll: func(context.Context, bool) (*headObservation, error) {
+			n := headAt(now.Sub(start))
+			return &headObservation{Number: n, Hash: fmt.Sprintf("0x%x", n), Timestamp: now.Unix()}, nil
+		},
+	})
+	follower := newTestTracker(ssr, nil, headTrackerDeps{now: clock, blockTime: func() time.Duration { return 0 }})
+	// Both instances share one in-process registry, so the follower reads
+	// the same counters; give it its own callbacks by observing values.
+	leader.leaseDeadlineNs.Store(start.Add(24 * time.Hour).UnixNano())
+	next := start
+	for now.Sub(start) < total {
+		if !now.Before(next) {
+			wait, err := leader.tick(ctx)
+			require.NoError(t, err)
+			next = now.Add(wait)
+		}
+		if now.Sub(start) > 2*leaderBt && follower.FreshHead() == 0 {
+			staleSeconds++
+		}
+		now = now.Add(time.Second)
+	}
+	return staleSeconds
+}
+
+func TestHeadTracker_SlowChainsStayFresh(t *testing.T) {
+	t.Run("ethereum missed slots", func(t *testing.T) {
+		// 12s slots, every 4th slot missed (24s gaps), 4 minutes.
+		stale := runSlowChainFreshness(t, 12*time.Second, func(e time.Duration) int64 {
+			slots := int64(e / (12 * time.Second))
+			return 20_000_000 + slots - slots/4
+		}, 4*time.Minute)
+		require.Zero(t, stale, "no fallback on missed slots")
+	})
+	t.Run("on-demand blocks", func(t *testing.T) {
+		// Nominal 5s blocks, then no block at all for 90s while every poll
+		// succeeds (redbelly/rootstock/saga style), then blocks again.
+		stale := runSlowChainFreshness(t, 5*time.Second, func(e time.Duration) int64 {
+			switch {
+			case e < 30*time.Second:
+				return 1000 + int64(e/(5*time.Second))
+			case e < 120*time.Second:
+				return 1006
+			default:
+				return 1006 + int64((e-120*time.Second)/(5*time.Second))
+			}
+		}, 3*time.Minute)
+		require.Zero(t, stale, "a chain that stops producing blocks is not a tracker failure")
+	})
+	t.Run("filecoin 30s with a cold follower EMA", func(t *testing.T) {
+		stale := runSlowChainFreshness(t, 30*time.Second, func(e time.Duration) int64 {
+			return 6_000_000 + int64(e/(30*time.Second))
+		}, 5*time.Minute)
+		require.Zero(t, stale)
+	})
+}
+
+// A dead leader (no successful poll) still sends followers into fallback
+// within ~3 × the observed poll cadence.
+func TestHeadTracker_DeadLeaderStillFallsBack(t *testing.T) {
+	ctx := t.Context()
+	ssr := newTestSSR(t, ctx)
+	now := time.Unix(1_700_000_000, 0)
+	clock := func() time.Time { return now }
+	n := int64(100)
+	leader := newTestTracker(ssr, nil, headTrackerDeps{now: clock, blockTime: func() time.Duration { return 12 * time.Second },
+		poll: func(context.Context, bool) (*headObservation, error) {
+			return &headObservation{Number: n, Timestamp: now.Unix()}, nil
+		}})
+	follower := newTestTracker(ssr, nil, headTrackerDeps{now: clock, blockTime: func() time.Duration { return 0 }})
+	leader.leaseDeadlineNs.Store(now.Add(24 * time.Hour).UnixNano())
+	for i := 0; i < 10; i++ {
+		_, _ = leader.tick(ctx)
+		now = now.Add(12 * time.Second)
+		n++
+	}
+	require.NotZero(t, follower.FreshHead())
+	// Leader dies: no more polls.
+	now = now.Add(37 * time.Second)
+	require.Zero(t, follower.FreshHead(), "stale after 3 × the 12s poll cadence")
+}

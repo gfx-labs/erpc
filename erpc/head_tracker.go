@@ -79,6 +79,11 @@ const (
 	headTrackerFutureSlack = 60 * time.Second
 	// headTrackerWarnEvery rate-limits the fallback WARN log.
 	headTrackerWarnEvery = time.Minute
+	// headTrackerGapSamples is how many recent liveness gaps staleAfter
+	// considers (the max of them).
+	headTrackerGapSamples = 16
+	// headTrackerMaxGap bounds a poll interval that counts as cadence.
+	headTrackerMaxGap = 5 * time.Minute
 	// headTrackerRecoverAfter is how many consecutive, mutually consistent
 	// polls below the regression tolerance it takes to accept a large
 	// rollback: the recovery path for a published head that was poisoned
@@ -160,6 +165,15 @@ type headTracker struct {
 	// counter callback.
 	advancedAtNs atomic.Int64
 	seenHead     atomic.Int64
+	seenAlive    atomic.Int64
+	// gaps (guarded by gapMu) holds recent intervals between liveness
+	// signals on this replica's clock; maxGapNs is their max.
+	gapMu    sync.Mutex
+	gaps     []time.Duration
+	maxGapNs atomic.Int64
+	// alive is the leader's liveness counter: unix ms of its last successful
+	// poll, published whether or not the head moved (at most once per poll).
+	alive data.CounterInt64SharedVariable
 	// lastFreshHead / lastFreshAtNs remember the last head served as fresh,
 	// the floor for the fallback path (S7).
 	lastFreshHead atomic.Int64
@@ -190,17 +204,38 @@ func newHeadTracker(projectId, networkId, label string, cfg *common.EvmHeadTrack
 		cfg:       cfg,
 		ssr:       ssr,
 		head:      ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTracker/"+scope, common.DefaultToleratedBlockHeadRollback),
+		alive:     ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTrackerAlive/"+scope, 0),
 		leaseKey:  "headTracker/" + scope,
 		deps:      deps,
 		logger:    &lg,
 	}
-	// A head counts as fresh only once THIS replica has seen it advance: the
-	// first value it learns (initial fetch of a possibly hours-old counter
-	// after boot) only seeds seenHead.
+	// Freshness is LIVENESS of the leader, not chain progress. The leader
+	// publishes a monotonic "alive" counter after every successful poll
+	// (new head or not), and a replica counts the head as fresh while it saw
+	// the counter (or the head) change within staleAfter, on its own clock.
+	// The first value a replica learns (initial fetch of a possibly
+	// hours-old counter after boot) only seeds the comparison.
+	//
+	// Head advancement alone was the wrong signal: on slow or irregular
+	// chains (ethereum missed slots, on-demand blocks on redbelly/
+	// rootstock/saga, filecoin null rounds) the head legitimately does not
+	// move for many block times while every poll succeeds, and replicas
+	// flapped into fallback although the head was correct.
 	t.head.OnValue(func(v int64) {
 		if prev := t.seenHead.Swap(v); prev > 0 && v != prev {
 			t.advancedAtNs.Store(t.deps.now().UnixNano())
 		}
+	})
+	t.alive.OnValue(func(v int64) {
+		prev := t.seenAlive.Swap(v)
+		if prev <= 0 || v == prev {
+			return
+		}
+		t.advancedAtNs.Store(t.deps.now().UnixNano())
+		// Both values were stamped by the leader's clock, so their
+		// difference is a pure duration (no cross-host skew): the leader's
+		// actual poll cadence.
+		t.noteLivenessGap(time.Duration(v-prev) * time.Millisecond)
 	})
 	return t
 }
@@ -223,10 +258,41 @@ func (t *headTracker) OnHead(cb func(int64)) {
 // IsLeader reports whether this replica currently polls.
 func (t *headTracker) IsLeader() bool { return t != nil && t.isLeader.Load() }
 
-// staleAfter is how long the head may go without advancing before replicas
-// fall back: max(3 × block time, headTrackerMinStale).
+// staleAfter is how long a replica may go without seeing a successful
+// leader poll (a head or alive counter change) before it falls back:
+// max(3 × block time, 3 × the longest recent interval between the leader's
+// successful polls, headTrackerMinStale).
+//
+// The leader's own poll interval is what makes followers correct on slow
+// chains: a follower never feeds the block-time EMA (only the leader sees
+// block timestamps, and the 60s per-upstream pollers take many minutes to
+// warm it on a 12-52s chain), so its blockTime() can sit at the 1s cold
+// default while the leader legitimately polls every 12-52s. The interval is
+// the difference of two consecutive alive values, both stamped by the
+// leader's clock, so no clock skew enters.
 func (t *headTracker) staleAfter() time.Duration {
-	return max(headTrackerStaleBlocks*t.blockTime(), headTrackerMinStale)
+	return max(headTrackerStaleBlocks*t.blockTime(), headTrackerStaleBlocks*time.Duration(t.maxGapNs.Load()), headTrackerMinStale)
+}
+
+// noteLivenessGap records one interval between the leader's successful polls;
+// the max over the recent window drives staleAfter. Intervals longer than
+// headTrackerMaxGap (a previous leader's counter from long ago, a restart)
+// are not cadence and are ignored.
+func (t *headTracker) noteLivenessGap(gap time.Duration) {
+	if gap <= 0 || gap > headTrackerMaxGap {
+		return
+	}
+	t.gapMu.Lock()
+	t.gaps = append(t.gaps, gap)
+	if len(t.gaps) > headTrackerGapSamples {
+		t.gaps = t.gaps[1:]
+	}
+	var m time.Duration
+	for _, g := range t.gaps {
+		m = max(m, g)
+	}
+	t.gapMu.Unlock()
+	t.maxGapNs.Store(int64(m))
 }
 
 // fresh reports the head when this replica saw it advance within staleAfter
@@ -482,10 +548,13 @@ func (t *headTracker) tick(ctx context.Context) (time.Duration, error) {
 
 	recovering := current-obs.Number > common.DefaultToleratedBlockHeadRollback
 	if obs.Number < current && !recovering {
-		// A slightly lagging upstream answered: the next block is not out yet.
+		// A slightly lagging upstream answered: the next block is not out
+		// yet. The poll succeeded and the published head is still correct.
+		t.publishAlive(ctx)
 		return t.staleWait(obs, now, bt), nil
 	}
 	if obs.Number == current {
+		t.publishAlive(ctx)
 		// Same height. A different hash is a same-height reorg (S2): the
 		// cached block and the block store entry for this height are
 		// orphaned, so rewrite them with the new canonical block. The
@@ -517,6 +586,7 @@ func (t *headTracker) tick(ctx context.Context) (time.Duration, error) {
 	}
 	t.advancedAtNs.Store(t.deps.now().UnixNano())
 	t.head.TryUpdate(ctx, obs.Number)
+	t.publishAlive(ctx)
 	if obs.Timestamp > 0 {
 		delay := now.Sub(time.Unix(obs.Timestamp, 0))
 		if delay >= 0 && delay <= 4*max(bt, time.Second) {
@@ -800,4 +870,18 @@ func fetchUpstreamBlockNumber(ctx context.Context, u common.EvmUpstream) (int64,
 		return 0, err
 	}
 	return common.HexToInt64(hex)
+}
+
+// publishAlive records a successful leader poll in the shared liveness
+// counter (unix ms, monotonic), so followers keep the head fresh while the
+// chain itself does not move. Only while the lease is provably held.
+func (t *headTracker) publishAlive(ctx context.Context) {
+	if !t.holdsLease() {
+		return
+	}
+	now := t.deps.now()
+	// The leader knows its own poll succeeded: fresh locally at once (its
+	// first head may only seed the counter callbacks).
+	t.advancedAtNs.Store(now.UnixNano())
+	t.alive.TryUpdate(ctx, now.UnixMilli())
 }
