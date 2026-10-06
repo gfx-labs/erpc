@@ -51,6 +51,40 @@ Illustrative, not a tuned production config — enable cluster-min served tip fo
 }]`}
 />
 
+## Fleet head tracker
+
+Opt in per network to have exactly one replica follow the chain head block by block and share it with the whole fleet. `eth_blockNumber` and `"latest"` then advance every block while every per-upstream state poller can stay on a slow interval.
+
+<ConfigTabs
+  path="projects[].networks[].evm.headTracker"
+  focusYaml="7-11"
+  focusTs="7-11"
+  yaml={`projects:
+  - id: main
+    networks:
+      - architecture: evm
+        evm:
+          chainId: 1
+          headTracker:
+            enabled: true
+            # also cache the full block (and its hashes-only form) once per head
+            fullBlocks: true`}
+  ts={`projects: [{
+  id: "main",
+  networks: [{
+    architecture: "evm",
+    evm: {
+      chainId: 1,
+      headTracker: {
+        enabled: true,
+        // also cache the full block (and its hashes-only form) once per head
+        fullBlocks: true,
+      },
+    },
+  }],
+}]`}
+/>
+
 ## Agent reference
 
 Copy one of these prompts into your AI agent session (Claude Code, Cursor, …) — each one
@@ -89,6 +123,51 @@ https://docs.erpc.cloud/reference/evm/block-tracking.llms.txt`}
 />
 
 <AISection title="Block tracking & served tip — full agent reference">
+
+### Fleet head tracker (`evm.headTracker`)
+
+Opt-in per network. Requires a `database.sharedState` connector with the `redis` driver (or `memory` for a single process): other drivers log an error and the tracker never runs.
+
+- **Election.** Every replica runs the loop. The holder of a token lease (`SET NX PX` on `<clusterKey>/lease/headTracker/<project>/<network>`, renewed every `leaseTtl/3`) polls; followers retry acquisition every `leaseTtl/5`, so a crashed leader is replaced within about `leaseTtl + leaseTtl/5`. A leader that cannot renew for `2/3·leaseTtl`, or whose poll fails 20 times in a row, steps down. A clean shutdown releases the lease immediately.
+- **Poll.** The leader sends `eth_getBlockByNumber("latest", fullBlocks)` through the network's normal `Forward` (selection policy, retries, failover and integrity checks all apply; cache reads, the multiplexer and the block store are bypassed, and the tag is never interpolated).
+- **Schedule.** After a new head, it waits until the next block's expected timestamp (`block.timestamp + blockTime + mean propagation delay`), clamped to `[max(500ms, blockTime/2), blockTime + delay]`. After an unchanged head, it waits for the expected next block if that block is still ahead, else `max(500ms, blockTime/4)`. Errors also retry at `max(500ms, blockTime/4)` with no backoff. `blockTime` is the network's EMA block time. `interval` overrides it (`BlockTimeAdaptiveDuration`). On cold start it is 1s.
+- **Publish.** Each accepted new head goes to a shared-state counter (`v2/headTracker/<project>/<network>`). Followers receive it by pub/sub.
+- **Serve.** While the head has advanced within `max(3·blockTime, 5s)`, `EvmHighestLatestBlockNumber` returns it directly (no majority, no servedTip clamps). `eth_blockNumber` is answered locally with no upstream call, and `eth_getBlockByNumber("latest", x)` is rewritten to the concrete head so the block store or cache serves it. Requests with `use-upstream` or `skipInterpolation` are left alone. When the head is stale, everything falls back to the per-upstream poller path (servedTip if enabled, else the corroborated second-highest head).
+- **Writes.** For each new head the leader feeds the block-time EMA with the on-chain timestamp. It caches `eth_getBlockByNumber(<hex>, full)` and `eth_getBlockByHash(<hash>, full)` under the normal cache policies, and with `fullBlocks` it also caches the derived hashes-only form. The block store adopts the header (and the body when full). A hashes-only poll never writes a full-block entry.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `evm.headTracker.enabled` | bool | `false` | Off: no tracker object exists and no code path changes. |
+| `evm.headTracker.fullBlocks` | bool | `false` | Poll with `true` and cache both variants. Costs one full block per head per network, not per replica. |
+| `evm.headTracker.interval` | `BlockTimeAdaptiveDuration` | unset (EMA block time, 1s cold) | Override the cadence. A fixed duration polls on a plain timer instead of aligning to block timestamps. Source: <SourceLink file="common/config_head_tracker.go" lines="44" /> |
+| `evm.headTracker.leaseTtl` | Duration | `5s` | Failover bound. Must be ≥1s. Source: <SourceLink file="common/config_head_tracker.go" lines="46" /> |
+
+**Guards** (no agreement from other upstreams is needed):
+
+- A regression of more than 1024 blocks is rejected.
+- A block timestamp more than 60s in the future is rejected.
+- More than `4·elapsed/blockTime + 16` blocks since the previous head is rejected.
+- A jump above about one minute of blocks requires the serving upstream's `eth_chainId` to match.
+
+Rejections increment `erpc_head_tracker_rejected_total{reason}`.
+
+**Gotchas**
+
+1. Upstreams behind the tracker head may receive requests for a block they do not have yet. Missing-data retry and failover, plus the on-demand force-poll in block-range availability checks, handle this. The upstream that served the leader's poll is advanced through `SuggestLatestBlock`.
+2. The future-block short-circuit treats the tracker head as available, so the advertised head is never nulled out by stale poller views.
+3. A halted chain looks like a stale tracker. After `max(3·blockTime, 5s)` replicas enter fallback (`erpc_head_tracker_fallback_active=1` plus a WARN at most once a minute).
+
+| Metric | Type | Labels |
+|---|---|---|
+| `erpc_head_tracker_head_block_number` | gauge | project, network |
+| `erpc_head_tracker_is_leader` | gauge | project, network |
+| `erpc_head_tracker_poll_duration_seconds` | histogram | project, network, outcome |
+| `erpc_head_tracker_propagation_delay_seconds` | histogram | project, network |
+| `erpc_head_tracker_served_lag_blocks` | gauge | project, network |
+| `erpc_head_tracker_fallback_active` / `erpc_head_tracker_fallback_total` | gauge / counter | project, network |
+| `erpc_head_tracker_rejected_total` | counter | project, network, reason |
+
+Source: [`erpc/head_tracker.go`](https://github.com/erpc/erpc/blob/main/erpc/head_tracker.go), [`erpc/head_tracker_integration.go`](https://github.com/erpc/erpc/blob/main/erpc/head_tracker_integration.go), [`data/shared_state_lease.go`](https://github.com/erpc/erpc/blob/main/data/shared_state_lease.go). Tests: `erpc/head_tracker_test.go`, `erpc/head_tracker_e2e_test.go`.
 
 ### How it works
 
