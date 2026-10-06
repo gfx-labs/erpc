@@ -2325,8 +2325,13 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 				Str("selectedUpstream", u.Id()).
 				Msg("selected upstream from list")
 
-			// Pre-forward: block availability gating → skip to next upstream
-			if skipErr, isRetryable := n.checkUpstreamBlockAvailability(loopCtx, u, effectiveReq, method); skipErr != nil {
+			// Pre-forward: head-tracker tip check, then block availability
+			// gating → skip to next upstream
+			skipErr, isRetryable := n.checkTipAvailability(loopCtx, u, effectiveReq, method)
+			if skipErr == nil {
+				skipErr, isRetryable = n.checkUpstreamBlockAvailability(loopCtx, u, effectiveReq, method)
+			}
+			if skipErr != nil {
 				n.handleBlockSkip(loopCtx, loopSpan, &ulg, u, effectiveReq, method, skipErr, isRetryable)
 				loopSpan.End()
 				continue
@@ -2611,12 +2616,6 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 	}
 	if execErr == nil && !isEmpty {
 		n.enrichStatePoller(ctx, method, req, resp)
-		if n.headTracker != nil {
-			// The upstream just served a tracked height: it has it.
-			if bn, ok := req.EvmBlockNumber().(int64); ok {
-				n.suggestServedHeight(resp, bn)
-			}
-		}
 
 		// Extract block number from successful response for block availability bounds check below.
 		var respBlockNumber int64
@@ -3075,19 +3074,6 @@ func (n *Network) checkUpstreamBlockAvailability(ctx context.Context, u common.U
 	// Above the configured upper bound. Classify retryability by distance to the live
 	// head: a block just ahead of the head (e.g. upper=latestBlockMinus:0) may become
 	// serveable shortly, so it is retryable within MaxRetryableBlockDistance.
-	//
-	// Head tracker: an upper bound derived from the head (latestBlockMinus) is
-	// computed from this upstream's slow poller view, which the fresh tracker
-	// head runs ahead of. Re-derive it from the tracked head so the upstream is
-	// not skipped (and force-polled) for blocks it serves; a static exactBlock
-	// cap is a declared serving range and stays as configured.
-	if maxBound != math.MaxInt64 && bn > maxBound {
-		if minus := configuredUpperLatestBlockMinus(eu); minus != nil {
-			if tracked := n.EvmTrackedHead(); tracked > 0 && tracked-*minus > maxBound {
-				maxBound = tracked - *minus
-			}
-		}
-	}
 	if maxBound != math.MaxInt64 && bn > maxBound {
 		telemetry.MetricUpstreamStaleUpperBound.WithLabelValues(
 			n.projectId, eu.VendorName(), n.Label(), eu.Id(), method, common.AvailbilityConfidenceBlockHead.String(),

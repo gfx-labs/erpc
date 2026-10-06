@@ -1320,3 +1320,11 @@ var (
 		Help:      "Leader poll results rejected by a sanity guard, by reason (regression, far_future, chain_id).",
 	}, []string{"project", "network", "reason"})
 )
+
+// MetricHeadTrackerTipChecksTotal counts head checks of an upstream made
+// because a tip read targeted a block above its known head (head tracker on).
+var MetricHeadTrackerTipChecksTotal = DefineCounter(prometheus.CounterOpts{
+	Namespace: "erpc",
+	Name:      "head_tracker_tip_checks_total",
+	Help:      "Head checks of an upstream before forwarding a tip read above its known head (debounced per upstream).",
+}, []string{"project", "network", "upstream"})

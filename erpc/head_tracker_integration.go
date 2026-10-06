@@ -255,72 +255,93 @@ func (n *Network) EvmTrackedHead() int64 {
 	return ht.fresh()
 }
 
-// suggestServedHeight advances the serving upstream's known head to a
-// tracked height it just served, so it is not considered behind for blocks
-// it demonstrably has. In-memory first (the shared push is deduped per value).
-func (n *Network) suggestServedHeight(resp *common.NormalizedResponse, blockNumber int64) {
-	if blockNumber <= 0 || resp == nil {
-		return
+// tipCheckMethods are the methods whose tip reads are checked against the
+// serving upstream's own head before forwarding while the head tracker is
+// fresh. They share one property: a node asked for a block it does not have
+// yet does NOT fail cleanly. It returns [] or a clamped range (eth_getLogs,
+// trace_filter, arbtrace_filter, eth_getBlockReceipts), null
+// (eth_getBlockByNumber), or even a result computed at its own older head
+// (eth_call on some providers). Extend this set when another method is seen
+// doing the same.
+var tipCheckMethods = map[string]struct{}{
+	"eth_getLogs":          {},
+	"trace_filter":         {},
+	"arbtrace_filter":      {},
+	"eth_getBlockReceipts": {},
+	"eth_getBlockByNumber": {},
+	"eth_getBlockByHash":   {},
+	"eth_call":             {},
+}
+
+// checkTipAvailability gates a tip read (a target block above the
+// upstream's known head, at or below the fresh tracker head) on the
+// upstream's OWN head:
+//
+//   - known head (state poller value) >= target: forward. The upstream that
+//     served the leader's latest poll is in this case without any check:
+//     the poll response advances its head (response enrichment), and that
+//     shared counter reaches every replica.
+//   - otherwise: one eth_blockNumber check of THAT upstream, at most once per
+//     (upstream, tracker head) in this process and single-flighted across
+//     concurrent requests. Its result advances the upstream's shared head
+//     counter (SuggestLatestBlock), so other replicas usually see it and skip
+//     their own check. Forward if head >= target, else skip it as
+//     block-unavailable (retryable) so selection moves to the next upstream,
+//     which goes through the same check.
+//
+// Debounce is keyed to the tracker head, not a timer: a timer debounce
+// (the poller's 0.7·blockTime) answers with the value read before the new
+// head appeared and would skip a current upstream right after every block.
+//
+// Nothing else advances an upstream's head on the strength of a request: a
+// response to a request for block N is not proof the upstream has N (a
+// lagging node answers [] / null / a result at its own head), so it is never
+// credited with N.
+//
+// Cost: at most ~1 eth_blockNumber per block per upstream that actually
+// receives tip traffic while behind (in steady state only failover traffic;
+// the leader-served upstream needs none).
+//
+// Residual, undetectable here: a load-balanced provider can answer the check
+// (or the leader's poll) from an up-to-date backend and the request itself
+// from a lagging one.
+//
+// Requests without a numeric target (by-hash lookups, tags that were not
+// interpolated, e.g. skipInterpolation) are not checked, and nothing runs
+// when the tracker is disabled or stale.
+func (n *Network) checkTipAvailability(ctx context.Context, u common.Upstream, req *common.NormalizedRequest, method string) (error, bool) {
+	if n.headTracker == nil {
+		return nil, false
+	}
+	if _, ok := tipCheckMethods[method]; !ok {
+		return nil, false
 	}
 	tracked := n.EvmTrackedHead()
-	if tracked == 0 || blockNumber > tracked {
-		return
+	if tracked <= 0 {
+		return nil, false
 	}
-	eu, ok := resp.Upstream().(common.EvmUpstream)
+	target, _ := req.EvmBlockNumber().(int64)
+	if target <= 0 || target > tracked {
+		return nil, false
+	}
+	eu, ok := u.(common.EvmUpstream)
 	if !ok {
-		return
+		return nil, false
 	}
-	if sp := eu.EvmStatePoller(); sp != nil && !sp.IsObjectNull() && sp.LatestBlock() < blockNumber {
-		sp.SuggestLatestBlock(blockNumber)
+	sp := eu.EvmStatePoller()
+	if sp == nil || sp.IsObjectNull() {
+		return nil, false
 	}
-}
-
-// configuredUpperLatestBlockMinus returns the upstream's configured
-// blockAvailability.upper.latestBlockMinus, or nil.
-func configuredUpperLatestBlockMinus(u common.Upstream) *int64 {
-	cfg := u.Config()
-	if cfg == nil || cfg.Evm == nil || cfg.Evm.BlockAvailability == nil || cfg.Evm.BlockAvailability.Upper == nil {
-		return nil
+	var tol int64
+	if cfg := u.Config(); cfg != nil && cfg.Evm != nil {
+		tol = cfg.Evm.HeadLagToleranceBlocks
 	}
-	up := cfg.Evm.BlockAvailability.Upper
-	if up.ExactBlock != nil {
-		return nil
+	if sp.LatestBlock()+tol >= target {
+		return nil, false
 	}
-	return up.LatestBlockMinus
-}
-
-// EvmProvenHead implements common.EvmProvenHeadNetwork: the highest known
-// head (state poller value, including SuggestLatestBlock advances) among the
-// network's eligible upstreams, plus each one's declared head-lag tolerance,
-// excluding `exclude` and every upstream that already failed the request
-// bound to ctx. The upstream that served the leader's poll is in this set
-// (response enrichment advanced its head), so it is normally the tracker
-// head itself.
-func (n *Network) EvmProvenHead(ctx context.Context, exclude common.Upstream) int64 {
-	req, _ := ctx.Value(common.RequestContextKey).(*common.NormalizedRequest)
-	var best int64
-	for _, u := range n.tipCandidateUpstreams(ctx, "*") {
-		if exclude != nil && u.Id() == exclude.Id() {
-			continue
-		}
-		if req != nil {
-			if _, failed := req.ErrorsByUpstream.Load(u); failed {
-				continue
-			}
-		}
-		eu, ok := u.(common.EvmUpstream)
-		if !ok {
-			continue
-		}
-		sp := eu.EvmStatePoller()
-		if sp == nil || sp.IsObjectNull() || eu.EvmSyncingState() == common.EvmSyncingStateSyncing {
-			continue
-		}
-		h := sp.LatestBlock()
-		if cfg := u.Config(); cfg != nil && cfg.Evm != nil {
-			h += cfg.Evm.HeadLagToleranceBlocks
-		}
-		best = max(best, h)
+	if head := n.headTracker.checkUpstreamHead(ctx, eu, tracked, n.projectId, n.Label()); head+tol >= target {
+		return nil, false
 	}
-	return best
+	latest, finalized := n.upstreamHeads(eu)
+	return common.NewErrUpstreamBlockUnavailable(u.Id(), target, latest, finalized), true
 }

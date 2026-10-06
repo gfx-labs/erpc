@@ -14,6 +14,7 @@ import (
 	"github.com/erpc/erpc/data"
 	"github.com/erpc/erpc/telemetry"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/singleflight"
 )
 
 // ─── Fleet head tracker ("stalker") ──────────────────────────────────────────
@@ -163,6 +164,10 @@ type headTracker struct {
 	// the floor for the fallback path (S7).
 	lastFreshHead atomic.Int64
 	lastFreshAtNs atomic.Int64
+
+	// checks / checkGroup back checkUpstreamHead (tip checks).
+	checks     sync.Map // upstream id -> *upstreamCheck
+	checkGroup singleflight.Group
 
 	stopOnce sync.Once
 	stop     context.CancelFunc
@@ -732,4 +737,67 @@ func parseHeadObservation(raw json.RawMessage) (*headObservation, error) {
 		}
 	}
 	return obs, nil
+}
+
+// upstreamCheck is the last tip head check of one upstream on this replica.
+type upstreamCheck struct {
+	trackedAt int64 // tracker head when the check ran
+	head      int64
+}
+
+// checkUpstreamHead returns u's head, asking it with eth_blockNumber at most
+// once per (upstream, tracker head) on this replica. Concurrent callers for
+// the same upstream share one call. The answer is fed into u's shared head
+// counter (SuggestLatestBlock), so the poller, the lag metrics and the other
+// replicas see it too. Returns the known head on any error.
+func (t *headTracker) checkUpstreamHead(ctx context.Context, u common.EvmUpstream, tracked int64, projectId, label string) int64 {
+	sp := u.EvmStatePoller()
+	id := u.Id()
+	if v, ok := t.checks.Load(id); ok {
+		if c := v.(*upstreamCheck); c.trackedAt >= tracked {
+			return max(c.head, sp.LatestBlock())
+		}
+	}
+	key := fmt.Sprintf("%s@%d", id, tracked)
+	v, _, _ := t.checkGroup.Do(key, func() (interface{}, error) {
+		if c, ok := t.checks.Load(id); ok && c.(*upstreamCheck).trackedAt >= tracked {
+			return c.(*upstreamCheck).head, nil
+		}
+		telemetry.MetricHeadTrackerTipChecksTotal.WithLabelValues(projectId, label, id).Inc()
+		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		head, err := fetchUpstreamBlockNumber(cctx, u)
+		if err != nil {
+			head = 0
+		} else if head > sp.LatestBlock() {
+			sp.SuggestLatestBlock(head)
+		}
+		t.checks.Store(id, &upstreamCheck{trackedAt: tracked, head: head})
+		return head, nil
+	})
+	return max(v.(int64), sp.LatestBlock())
+}
+
+// fetchUpstreamBlockNumber asks one upstream for eth_blockNumber directly.
+func fetchUpstreamBlockNumber(ctx context.Context, u common.EvmUpstream) (int64, error) {
+	rq := common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}`))
+	resp, err := u.Forward(ctx, rq, true, false)
+	if resp != nil {
+		defer resp.Release()
+	}
+	if err != nil {
+		return 0, err
+	}
+	jrr, err := resp.JsonRpcResponse(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if jrr.Error != nil {
+		return 0, jrr.Error
+	}
+	var hex string
+	if err := json.Unmarshal(jrr.GetResultBytes(), &hex); err != nil {
+		return 0, err
+	}
+	return common.HexToInt64(hex)
 }
