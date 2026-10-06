@@ -2604,6 +2604,12 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 	}
 	if execErr == nil && !isEmpty {
 		n.enrichStatePoller(ctx, method, req, resp)
+		if n.headTracker != nil {
+			// The upstream just served a tracked height: it has it.
+			if bn, ok := req.EvmBlockNumber().(int64); ok {
+				n.suggestServedHeight(resp, bn)
+			}
+		}
 
 		// Extract block number from successful response for block availability bounds check below.
 		var respBlockNumber int64
@@ -2937,7 +2943,13 @@ func (n *Network) handleBlockSkip(
 	// latestBlock stays stale until the background ticker fires (often 10s+).
 	// PollLatestBlockNumber respects its own debounce interval so concurrent
 	// triggers from multiple upstreams/requests are coalesced safely.
-	if isRetryable {
+	//
+	// Not while the head tracker is fresh: the tracker head runs ahead of
+	// every slow poller by design, so this would fire per upstream per
+	// replica every block and bring back the polling the tracker removes.
+	// The request fails over to another upstream instead, and the poller
+	// catches up on its own interval or through response enrichment.
+	if isRetryable && n.EvmTrackedHead() == 0 {
 		if eu, ok := u.(common.EvmUpstream); ok {
 			if sp := eu.EvmStatePoller(); sp != nil && !sp.IsObjectNull() {
 				go func() { // #nosec G118 -- fire-and-forget poll; must not share request lifetime

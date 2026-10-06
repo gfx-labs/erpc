@@ -157,3 +157,29 @@ type TrackedMetrics interface {
 	ErrorRate() float64
 	GetResponseQuantiles() QuantileTracker
 }
+
+// EvmTrackedHeadNetwork is implemented by networks that run the fleet head
+// tracker (evm.headTracker). EvmTrackedHead returns the tracker head while it
+// is fresh, else 0.
+type EvmTrackedHeadNetwork interface {
+	EvmTrackedHead() int64
+}
+
+// EvmTrackedHeadFromContext returns the fresh tracker head of the network of
+// the request bound to ctx, or 0 when there is none (no request, no tracker,
+// or a stale head). Upstream-level availability checks use it to treat a
+// block the tracker has already observed as servable instead of force-polling
+// the upstream's head on every request.
+func EvmTrackedHeadFromContext(ctx context.Context) int64 {
+	if ctx == nil {
+		return 0
+	}
+	req, ok := ctx.Value(RequestContextKey).(*NormalizedRequest)
+	if !ok || req == nil {
+		return 0
+	}
+	if n, ok := req.Network().(EvmTrackedHeadNetwork); ok {
+		return n.EvmTrackedHead()
+	}
+	return 0
+}

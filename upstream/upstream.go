@@ -1171,6 +1171,13 @@ func (u *Upstream) EvmBlockAvailabilityBounds() (int64, int64) {
 // It returns whether the block is within the available range and records metrics if not.
 func (u *Upstream) assertUpstreamLowerBound(ctx context.Context, statePoller common.EvmStatePoller, blockNumber int64, maxAvailableRecentBlocks int64, forMethod string, confidence common.AvailbilityConfidence) (available bool, err error) {
 	latestBlock := statePoller.LatestBlock()
+	// With the fleet head tracker the slow poller's head lags the chain, so
+	// measure the pruning window from the tracked head when it is ahead.
+	// The near-boundary poll below stays: it only fires for blocks within
+	// 10 of the pruning edge, which head-following traffic never touches.
+	if tracked := common.EvmTrackedHeadFromContext(ctx); tracked > latestBlock {
+		latestBlock = tracked
+	}
 	firstAvailableBlock := latestBlock - maxAvailableRecentBlocks
 	available = blockNumber >= firstAvailableBlock
 

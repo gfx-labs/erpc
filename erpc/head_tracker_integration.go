@@ -242,3 +242,38 @@ func (n *Network) rewriteLatestToTrackerHead(ctx context.Context, req *common.No
 	req.SetEvmBlockRef(strconv.FormatInt(head, 10))
 	req.SetFinality(n.GetFinality(ctx, req, nil))
 }
+
+// EvmTrackedHead implements common.EvmTrackedHeadNetwork: the fresh tracker
+// head, or 0 when the tracker is disabled or stale. It records no fallback
+// transition (FreshHead's side effects belong to the serving path).
+func (n *Network) EvmTrackedHead() int64 {
+	ht := n.headTracker
+	if ht == nil {
+		return 0
+	}
+	v := ht.head.GetValue()
+	if v <= 0 || ht.head.IsStale(ht.staleAfter()) {
+		return 0
+	}
+	return v
+}
+
+// suggestServedHeight advances the serving upstream's known head to a
+// tracked height it just served, so it is not considered behind for blocks
+// it demonstrably has. In-memory first (the shared push is deduped per value).
+func (n *Network) suggestServedHeight(resp *common.NormalizedResponse, blockNumber int64) {
+	if blockNumber <= 0 || resp == nil {
+		return
+	}
+	tracked := n.EvmTrackedHead()
+	if tracked == 0 || blockNumber > tracked {
+		return
+	}
+	eu, ok := resp.Upstream().(common.EvmUpstream)
+	if !ok {
+		return
+	}
+	if sp := eu.EvmStatePoller(); sp != nil && !sp.IsObjectNull() && sp.LatestBlock() < blockNumber {
+		sp.SuggestLatestBlock(blockNumber)
+	}
+}

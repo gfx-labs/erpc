@@ -39,6 +39,12 @@ type timedChain struct {
 	byHashCalls   atomic.Int64
 	// frozenBlockNumber, when > 0, is what eth_blockNumber returns.
 	frozenBlockNumber atomic.Int64
+	// lagBlocks makes this node see the chain that many blocks late: a
+	// lagging upstream that returns null (or an error) for the head block.
+	lagBlocks atomic.Int64
+	// failData makes eth_call / eth_getLogs fail with a retryable server
+	// error, so data traffic fails over to the other upstreams.
+	failData atomic.Bool
 }
 
 func newTimedChain(blockTime time.Duration, base int64) *timedChain {
@@ -50,7 +56,18 @@ func newTimedChain(blockTime time.Duration, base int64) *timedChain {
 func (c *timedChain) Close()      { c.srv.Close() }
 func (c *timedChain) URL() string { return c.srv.URL }
 
-func (c *timedChain) head() int64 { return c.base + int64(time.Since(c.start)/c.blockTime) }
+func (c *timedChain) head() int64 {
+	return c.base + int64(time.Since(c.start)/c.blockTime) - c.lagBlocks.Load()
+}
+
+// view returns a node sharing the same chain (start, base, block time) but
+// with its own server and counters, so several upstreams of one network can
+// be observed separately.
+func (c *timedChain) view() *timedChain {
+	v := &timedChain{start: c.start, blockTime: c.blockTime, base: c.base, calls: map[string]int{}}
+	v.srv = httptest.NewServer(http.HandlerFunc(v.serve))
+	return v
+}
 
 func (c *timedChain) Calls(method string) int {
 	c.mu.Lock()
@@ -97,6 +114,11 @@ func (c *timedChain) serve(w http.ResponseWriter, r *http.Request) {
 	c.mu.Unlock()
 	var result interface{}
 	var rpcErr interface{}
+	if c.failData.Load() && (req.Method == "eth_call" || req.Method == "eth_getLogs") {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"temporarily unavailable"}}`))
+		return
+	}
 	switch req.Method {
 	case "eth_chainId":
 		result = "0x7b"
@@ -115,12 +137,29 @@ func (c *timedChain) serve(w http.ResponseWriter, r *http.Request) {
 		if len(req.Params) > 1 {
 			_ = json.Unmarshal(req.Params[1], &tag)
 		}
+		if strings.HasPrefix(tag, "0x") {
+			if n, err := strconv.ParseInt(tag[2:], 16, 64); err == nil && n > c.head() {
+				rpcErr = map[string]interface{}{"code": -32000, "message": "header not found"}
+				break
+			}
+		}
 		result = "0x" + strings.Repeat("0", 63) + "1"
 		if tag != "latest" {
 			// Echo a different value for interpolated calls so a test can
 			// tell whether "latest" reached the upstream untouched.
 			result = "0x" + strings.Repeat("0", 63) + "2"
 		}
+	case "eth_getLogs":
+		var flt map[string]interface{}
+		_ = json.Unmarshal(req.Params[0], &flt)
+		to, _ := flt["toBlock"].(string)
+		if strings.HasPrefix(to, "0x") {
+			if n, err := strconv.ParseInt(to[2:], 16, 64); err == nil && n > c.head() {
+				rpcErr = map[string]interface{}{"code": -32000, "message": "block range extends beyond current head block"}
+				break
+			}
+		}
+		result = []interface{}{}
 	case "eth_getBlockByNumber", "eth_getBlockByHash":
 		var ref string
 		var full bool
@@ -437,4 +476,93 @@ func TestHeadTracker_E2E_PremiumPassthroughWhileDisabled(t *testing.T) {
 	require.NoError(t, json.Unmarshal(res.Result, &blk))
 	n, _ := common.HexToInt64(blk.Number)
 	require.Greater(t, n, stale, "latest block is live, not the stale poller head")
+}
+
+// Regression (review blocker): with the tracker on, "latest" interpolates to
+// the tracker head, which is ahead of every upstream's 60s poller view. The
+// block-availability gates must then NOT force-poll each upstream's head per
+// request (that brings back per-upstream per-block polling). 3 replicas × 3
+// upstreams, 1s blocks, a steady stream of eth_getLogs(toBlock=latest),
+// eth_call(latest) and getBlockByNumber(latest): total upstream
+// latest/blockNumber polls stay ≈ 1 per block (the leader only) plus the
+// pollers' own ticks. One upstream lags two blocks and answers null/errors
+// for the head: requests still succeed by failing over.
+func TestHeadTracker_E2E_NoPerUpstreamPollingUnderLatestTraffic(t *testing.T) {
+	mr := miniredis.RunT(t)
+	chain := newTimedChain(time.Second, 20_000)
+	defer chain.Close()
+	ups := []*timedChain{chain, chain.view(), chain.view()}
+	defer ups[1].Close()
+	defer ups[2].Close()
+	// u0 (first in order) answers the leader's latest polls, so its known
+	// head stays current through response enrichment. Make it fail data
+	// methods so that traffic lands on u1/u2, whose 60s poller views are
+	// stale: exactly the upstreams the availability gate used to force-poll.
+	ups[0].failData.Store(true)
+	ups[2].lagBlocks.Store(2)
+
+	cluster := fmt.Sprintf("ht-nopoll-%d", time.Now().UnixNano())
+	mk := func() *common.Config {
+		cfg := headTrackerTestConfig(mr.Addr(), cluster, chain.URL(),
+			&common.EvmHeadTrackerConfig{Enabled: true, LeaseTtl: common.Duration(2 * time.Second)}, false)
+		prj := cfg.Projects[0]
+		base := prj.Upstreams[0]
+		prj.Upstreams = nil
+		for i, u := range ups {
+			c := *base
+			evmCfg := *base.Evm
+			c.Evm = &evmCfg
+			c.Id = fmt.Sprintf("u%d", i)
+			c.Endpoint = u.URL()
+			prj.Upstreams = append(prj.Upstreams, &c)
+		}
+		return cfg
+	}
+	reps := startHTReplicas(t, 3, mk)
+	require.Eventually(t, func() bool {
+		for _, r := range reps {
+			if trackerOf(t, r).FreshHead() < chain.head()-1 {
+				return false
+			}
+		}
+		return true
+	}, 15*time.Second, 50*time.Millisecond)
+
+	headPolls := func() int64 {
+		var n int64
+		for _, u := range ups {
+			n += u.latestCalls.Load() + int64(u.Calls("eth_blockNumber"))
+		}
+		return n
+	}
+	start := headPolls()
+	const blocks = 30
+	deadline := time.Now().Add(blocks * chain.blockTime)
+	var reqs, fails int
+	for time.Now().Before(deadline) {
+		for _, r := range reps {
+			for _, q := range []struct{ m, p string }{
+				{"eth_getLogs", `[{"fromBlock":"latest","toBlock":"latest"}]`},
+				{"eth_call", `[{"to":"0x0000000000000000000000000000000000000002","data":"0x"},"latest"]`},
+				{"eth_getBlockByNumber", `["latest",false]`},
+			} {
+				reqs++
+				code, _, body := r.send(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":%q,"params":%s}`, q.m, q.p), nil, nil)
+				var resp rpcResp
+				_ = json.Unmarshal([]byte(body), &resp)
+				if code != 200 || len(resp.Error) > 0 || string(resp.Result) == "null" {
+					fails++
+					t.Logf("%s failed: %d %s", q.m, code, body)
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	polls := headPolls() - start
+	t.Logf("%d requests over %d blocks: %d upstream latest/blockNumber polls (%.2f per block), %d failures",
+		reqs, blocks, polls, float64(polls)/blocks, fails)
+	require.Zero(t, fails, "requests succeed even though one upstream lags the head")
+	// Leader: ~1/block. Slack for a stale retry or two and the 60s pollers'
+	// ticks (3 upstreams × 3 replicas, at most one tick each in the window).
+	require.LessOrEqual(t, float64(polls), blocks*1.3+9, "no per-upstream per-request head polling")
 }

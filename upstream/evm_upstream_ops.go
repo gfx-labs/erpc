@@ -219,6 +219,19 @@ func (u *Upstream) EvmAssertBlockAvailability(ctx context.Context, forMethod str
 		// block internally. The gate then only reroutes requests pinned
 		// beyond head+tolerance.
 		tolerance := cfg.Evm.HeadLagToleranceBlocks
+		// Fleet head tracker: a block at or below the network's fresh tracker
+		// head has been observed through normal routing, so it exists. Treat
+		// it as servable (optimistically, like venn) instead of force-polling
+		// this upstream's head per request: with slow state pollers the
+		// tracker head is ahead of every upstream's known head, and a
+		// per-request poll would bring back per-upstream per-block polling. An
+		// upstream that really lacks the block answers empty or with an
+		// error, and the network's missing-data retry and failover move the
+		// request to another upstream. Configured availability bounds were
+		// already enforced above.
+		if tracked := common.EvmTrackedHeadFromContext(ctx); tracked > 0 && blockNumber <= tracked+tolerance && blockNumber > latestBlock+tolerance {
+			latestBlock = tracked
+		}
 		// If the requested block is beyond the current latest block (plus
 		// tolerance), try force-polling once
 		if blockNumber > latestBlock+tolerance && forceFreshIfStale {
