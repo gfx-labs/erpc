@@ -1199,6 +1199,15 @@ func (r *NormalizedRequest) SetParentRequestId(parentId interface{}) {
 	r.parentRequestId.Store(parentId)
 }
 
+// SetFinality replaces the memoized finality, for callers that rewrite the
+// request's block reference (e.g. "latest" to a concrete number) after
+// finality was first derived from the tag.
+func (r *NormalizedRequest) SetFinality(f DataFinalityState) {
+	if r != nil {
+		r.finality.Store(f)
+	}
+}
+
 func (r *NormalizedRequest) Finality(ctx context.Context) DataFinalityState {
 	if r == nil {
 		return DataFinalityStateUnknown
