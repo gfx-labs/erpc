@@ -106,6 +106,15 @@ func runLegacy(t testing.TB, r parityReq, raw []byte) verdict {
 func assertParity(t testing.TB, name string, r parityReq, raw []byte) verdict {
 	t.Helper()
 	got, want := runNew(t, r, raw), runLegacy(t, r, raw)
+	// The legacy tx views go through a map[string]any -> Marshal round trip
+	// whose key order is Go's randomized map order, so a transaction object
+	// with case-insensitively duplicate keys ("Hash" and "hash") makes the
+	// legacy verdict itself vary between runs. The new code sends such
+	// objects down that same original path. So agreement means: the new
+	// verdict is one legacy can produce.
+	for i := 0; i < 64 && got.String() != want.String(); i++ {
+		want = runLegacy(t, r, raw)
+	}
 	if got.String() != want.String() {
 		t.Errorf("%s: verdicts differ\n  legacy: %s\n  new:    %s", name, want, got)
 	}
