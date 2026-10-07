@@ -852,6 +852,16 @@ func (t *headTracker) tick(ctx context.Context) (time.Duration, error) {
 			}
 			t.prev = obs
 		} else if t.prev == nil {
+			// First observation since this replica (re)acquired the lease:
+			// the hash the previous leader wrote at this height is unknown,
+			// and a same-height reorg during the handover would otherwise
+			// leave the orphaned block cached until it expires. Write the
+			// observed block unconditionally; for the same hash this is an
+			// idempotent overwrite (the block store reconfirms it without a
+			// parse), once per leadership change.
+			if t.deps.onAccepted != nil {
+				t.deps.onAccepted(ctx, obs)
+			}
 			t.prev, t.prevAt = obs, now
 		}
 		return sinceSent(t.staleWait(obs, now, bt), elapsed), nil
