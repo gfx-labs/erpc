@@ -467,6 +467,18 @@ func TestHeadTracker_NoPublishPastLeaseDeadline(t *testing.T) {
 	require.Zero(t, ht.Head())
 }
 
+func TestHeadTracker_ReleasedLeaseCannotPublish(t *testing.T) {
+	ssr := newTestSSR(t, t.Context())
+	ht := newTestTracker(ssr, nil, headTrackerDeps{blockTime: func() time.Duration { return time.Second }})
+	lease, err := ssr.AcquireLease(t.Context(), "released-head", time.Hour)
+	require.NoError(t, err)
+	require.NotNil(t, lease)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	ht.lead(ctx, lease, time.Hour)
+	require.False(t, ht.holdsLease(), "a released lease must fence an in-flight tick")
+}
+
 // Several replicas share one shared state: exactly one polls, ~1 call per
 // block, and when the leader stops another takes over within ~TTL + 1 block
 // and the head keeps advancing.

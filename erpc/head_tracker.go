@@ -599,6 +599,7 @@ func (t *headTracker) lead(ctx context.Context, lease data.Lease, ttl time.Durat
 	t.logger.Info().Str("instance", t.ssr.InstanceId()).Msg("head tracker acquired leadership")
 	defer func() {
 		t.isLeader.Store(false)
+		t.leaseDeadlineNs.Store(0)
 		telemetry.MetricHeadTrackerIsLeader.WithLabelValues(t.projectId, t.label).Set(0)
 		if !t.abandonLease.Load() {
 			rctx, rcancel := context.WithTimeout(context.Background(), 2*time.Second)
