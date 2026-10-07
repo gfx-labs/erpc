@@ -2018,6 +2018,7 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 		upstreamSpan.SetAttributes(attribute.Int("upstreams.method_ineligible", dropped))
 		upsList = eligible
 	}
+	upsList = n.preferKnownTipUpstreams(ctx, upsList, req, method)
 	upstreamSpan.SetAttributes(attribute.Int("upstreams.count", len(upsList)))
 	if common.IsTracingDetailed {
 		ids := make([]string, len(upsList))

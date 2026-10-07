@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -46,7 +47,8 @@ func (nr *NetworksRegistry) initHeadTracker(network *Network, nwCfg *common.Netw
 		// target), so the selection policy must not exclude/reorder
 		// upstreams on the 60s state-poller lag view, nor shadow-probe
 		// upstreams excluded only for lag. Unmasked the moment the tracker
-		// goes stale.
+		// goes stale. The request path prefers eligible upstreams already
+		// known to have its target, preserving policy order within each group.
 		network.policyEngine.SetNetworkHooks(network.networkId, &policy.NetworkHooks{
 			HeadLagOnDemand: func() bool { return network.EvmTrackedHead() > 0 },
 		})
@@ -286,6 +288,52 @@ var tipCheckMethods = map[string]struct{}{
 	"eth_call":             {},
 }
 
+// preferKnownTipUpstreams restores request-specific freshness preference lost
+// when policy evaluation masks slow-poller lag. It neither excludes upstreams
+// nor contacts them: behind/unknown upstreams remain available for lazy failover
+// checks. Policy order is preserved among known-ready upstreams and among the
+// rest. In particular, the leader-served upstream needs no verification RPC.
+func (n *Network) preferKnownTipUpstreams(ctx context.Context, ups []common.Upstream, req *common.NormalizedRequest, method string) []common.Upstream {
+	if n.headTracker == nil || len(ups) < 2 || ctx.Value(headTrackerPollKey{}) != nil {
+		return ups
+	}
+	if _, ok := tipCheckMethods[method]; !ok {
+		return ups
+	}
+	target, _ := req.EvmBlockNumber().(int64)
+	if target <= 0 || target > n.EvmTrackedHead() {
+		return ups
+	}
+	// Never mutate the policy engine's shared cached slice. Snapshot each
+	// upstream once so concurrent head advances cannot duplicate/drop entries.
+	ordered := make([]common.Upstream, len(ups))
+	ready, behind := 0, len(ups)
+	for _, u := range ups {
+		known := false
+		if eu, ok := u.(common.EvmUpstream); ok {
+			if sp := eu.EvmStatePoller(); sp != nil && !sp.IsObjectNull() {
+				known = sp.LatestBlock()+upstreamHeadLagTolerance(u) >= target
+			}
+		}
+		if known {
+			ordered[ready] = u
+			ready++
+		} else {
+			behind--
+			ordered[behind] = u
+		}
+	}
+	slices.Reverse(ordered[ready:])
+	return ordered
+}
+
+func upstreamHeadLagTolerance(u common.Upstream) int64 {
+	if cfg := u.Config(); cfg != nil && cfg.Evm != nil {
+		return cfg.Evm.HeadLagToleranceBlocks
+	}
+	return 0
+}
+
 // checkTipAvailability gates a tip read (a target block above the
 // upstream's known head, at or below the fresh tracker head) on the
 // upstream's OWN head:
@@ -345,10 +393,7 @@ func (n *Network) checkTipAvailability(ctx context.Context, u common.Upstream, r
 	if sp == nil || sp.IsObjectNull() {
 		return nil, false
 	}
-	var tol int64
-	if cfg := u.Config(); cfg != nil && cfg.Evm != nil {
-		tol = cfg.Evm.HeadLagToleranceBlocks
-	}
+	tol := upstreamHeadLagTolerance(u)
 	if sp.LatestBlock()+tol >= target {
 		return nil, false
 	}
