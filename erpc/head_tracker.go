@@ -237,13 +237,13 @@ func newHeadTracker(projectId, networkId, label string, cfg *common.EvmHeadTrack
 	}
 	lg := logger.With().Str("component", "headTracker").Logger()
 	scope := projectId + "/" + networkId
+	// Only the leader writes the head counter; tick vets every rollback before publishing.
 	t := &headTracker{
 		projectId:   projectId,
 		networkId:   networkId,
 		label:       label,
 		cfg:         cfg,
 		ssr:         ssr,
-		// Only the leader writes this counter; tick vets every rollback before publishing.
 		head:        ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTracker/"+scope, 0),
 		alive:       ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTrackerAlive/"+scope, 0),
 		staleMs:     ssr.GetCounterInt64(data.CounterValueSchemaVersion+"/headTrackerStaleMs/"+scope, 0),
