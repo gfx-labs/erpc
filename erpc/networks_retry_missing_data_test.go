@@ -59,9 +59,12 @@ func TestNetworkRetry_EthCallNullWithoutRetryEmpty(t *testing.T) {
 				&common.RetryPolicyConfig{MaxAttempts: 2})
 			if tc.wantError {
 				cache := &common.MockCacheDal{}
-				cache.On("Get", mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+				cache.On("Get", mock.Anything, mock.Anything).Return(nil, nil)
 				network.cacheDal = cache
-				defer func() { cache.AssertNotCalled(t, "Set", mock.Anything, mock.Anything, mock.Anything) }()
+				defer func() {
+					cache.AssertCalled(t, "Get", mock.Anything, mock.Anything)
+					cache.AssertNotCalled(t, "Set", mock.Anything, mock.Anything, mock.Anything)
+				}()
 			}
 			network.PinUpstreamOrderForTest("rpc1", "rpc2")
 			req := common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0x123"},"latest"]}`))
@@ -77,6 +80,45 @@ func TestNetworkRetry_EthCallNullWithoutRetryEmpty(t *testing.T) {
 				assert.Equal(t, `"0x42"`, jrr.GetResultString())
 			}
 			assert.GreaterOrEqual(t, calls, 2)
+		})
+	}
+}
+
+func TestNetworkRetry_EthCallHexResultsCacheable(t *testing.T) {
+	for _, result := range []string{"0x", "0x00000000"} {
+		t.Run(result, func(t *testing.T) {
+			util.ResetGock()
+			defer util.ResetGock()
+			util.SetupMocksForEvmStatePoller()
+			gock.New("http://rpc1.localhost").Post("").Filter(func(r *http.Request) bool {
+				return strings.Contains(util.SafeReadBody(r), "eth_call")
+			}).Times(1).Reply(200).JSON(map[string]interface{}{"jsonrpc": "2.0", "id": 1, "result": result})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			network := setupTestNetworkForMissingDataRetry(t, ctx,
+				&common.DirectiveDefaultsConfig{RetryEmpty: util.BoolPtr(false)},
+				&common.RetryPolicyConfig{MaxAttempts: 2})
+			network.PinUpstreamOrderForTest("rpc1", "rpc2")
+			cache := &common.MockCacheDal{}
+			cache.On("Get", mock.Anything, mock.Anything).Return(nil, nil)
+			written := make(chan struct{}, 1)
+			cache.On("Set", mock.Anything, mock.Anything, mock.Anything).Run(func(mock.Arguments) {
+				written <- struct{}{}
+			}).Return(nil)
+			network.cacheDal = cache
+			req := common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0x123"},"latest"]}`))
+			req.ApplyDirectiveDefaults(network.cfg.DirectiveDefaults)
+			resp, err := network.Forward(ctx, req)
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			jrr, err := resp.JsonRpcResponse()
+			require.NoError(t, err)
+			assert.Equal(t, `"`+result+`"`, jrr.GetResultString())
+			select {
+			case <-written:
+			case <-time.After(3 * time.Second):
+				t.Fatal("valid hex response was not written to cache")
+			}
 		})
 	}
 }
