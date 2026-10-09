@@ -1,0 +1,157 @@
+package erpc
+
+import (
+	"context"
+	"math"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/erpc/erpc/data"
+)
+
+// headTrackerBalancer spreads head-tracker leases across replicas. Without
+// it the first replica to boot grabs every network's lease (the others only
+// ever see held leases), and that one pod pays every network's poll, decode,
+// integrity check and cache write: on lat-dev ~2 cores for 31 networks, and
+// polls slowed enough to fall behind fast chains.
+//
+// Rule (a soft preference, never a correctness condition): a replica that
+// already leads >= ceil(networks / replicas) networks does not try to acquire
+// a FREE lease for a short while, giving a less loaded replica the first
+// chance. It still takes the lease if nobody else has after that delay, so
+// a network is never left without a leader because of balancing. A leader
+// over its share hands over one lease at a time (releases it) only when some
+// other replica is below its share, which the shared leader counts show.
+type headTrackerBalancer struct {
+	ssr data.SharedStateRegistry
+
+	mu       sync.Mutex
+	trackers map[*headTracker]struct{}
+
+	// ctxs are the registered trackers' contexts; running is set while a
+	// heartbeat loop runs (both under mu).
+	ctxs    map[*headTracker]context.Context
+	running bool
+
+	replicas atomic.Int64
+}
+
+var (
+	balancersMu sync.Mutex
+	balancers   = map[data.SharedStateRegistry]*headTrackerBalancer{}
+)
+
+// headTrackerBalancerFor returns the per-registry (= per-process, per-cluster)
+// balancer.
+func headTrackerBalancerFor(ssr data.SharedStateRegistry) *headTrackerBalancer {
+	balancersMu.Lock()
+	defer balancersMu.Unlock()
+	b, ok := balancers[ssr]
+	if !ok {
+		b = &headTrackerBalancer{ssr: ssr, trackers: map[*headTracker]struct{}{}, ctxs: map[*headTracker]context.Context{}}
+		b.replicas.Store(1)
+		balancers[ssr] = b
+	}
+	return b
+}
+
+const headTrackerReplicaHeartbeat = 5 * time.Second
+
+func (b *headTrackerBalancer) register(ctx context.Context, t *headTracker) {
+	b.mu.Lock()
+	b.trackers[t] = struct{}{}
+	b.ctxs[t] = ctx
+	start := !b.running
+	b.running = true
+	b.mu.Unlock()
+	if start {
+		go b.heartbeatLoop(ctx)
+	}
+}
+
+// heartbeatLoop runs on one registered tracker's context. When that tracker
+// stops (its context ends, e.g. its network was removed or reloaded) the
+// loop hands over to another registered tracker's context instead of
+// leaving the replica count frozen; with none left it ends, and the next
+// register starts a new one.
+func (b *headTrackerBalancer) heartbeatLoop(ctx context.Context) {
+	tk := time.NewTicker(headTrackerReplicaHeartbeat)
+	defer tk.Stop()
+	for {
+		hctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		n, err := b.ssr.HeartbeatReplicas(hctx, 3*headTrackerReplicaHeartbeat)
+		cancel()
+		if err == nil && n > 0 {
+			b.replicas.Store(int64(n))
+		}
+		select {
+		case <-ctx.Done():
+			if ctx = b.nextContext(); ctx == nil {
+				return
+			}
+		case <-tk.C:
+		}
+	}
+}
+
+// nextContext returns a live registered tracker context, or nil (and marks
+// the loop stopped) when there is none.
+func (b *headTrackerBalancer) nextContext() context.Context {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, c := range b.ctxs {
+		if c.Err() == nil {
+			return c
+		}
+	}
+	b.running = false
+	return nil
+}
+
+func (b *headTrackerBalancer) unregister(t *headTracker) {
+	b.mu.Lock()
+	delete(b.trackers, t)
+	delete(b.ctxs, t)
+	b.mu.Unlock()
+}
+
+// share is ceil(networks / replicas): the number of leases a replica may
+// hold before it defers acquiring more.
+func (b *headTrackerBalancer) share() int {
+	b.mu.Lock()
+	n := len(b.trackers)
+	b.mu.Unlock()
+	r := max(b.replicas.Load(), 1)
+	return int(math.Ceil(float64(n) / float64(r)))
+}
+
+func (b *headTrackerBalancer) leading() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	c := 0
+	for t := range b.trackers {
+		if t.IsLeader() {
+			c++
+		}
+	}
+	return c
+}
+
+// shouldDefer reports whether this replica should wait before trying to
+// acquire a free lease: it already leads at least its share.
+func (b *headTrackerBalancer) shouldDefer() bool {
+	if b == nil || b.replicas.Load() <= 1 {
+		return false
+	}
+	return b.leading() >= b.share()
+}
+
+// overShare reports whether this replica leads MORE than its share, i.e. it
+// should hand one lease over.
+func (b *headTrackerBalancer) overShare() bool {
+	if b == nil || b.replicas.Load() <= 1 {
+		return false
+	}
+	return b.leading() > b.share()
+}

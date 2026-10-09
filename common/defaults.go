@@ -790,6 +790,7 @@ func (c *TracingConfig) SetDefaults() error {
 }
 
 func (s *ServerConfig) SetDefaults() error {
+	s.WebSocket.SetDefaults()
 	if s.ListenV4 == nil {
 		if !util.IsTest() || os.Getenv("FORCE_TEST_LISTEN_V4") == "true" {
 			s.ListenV4 = util.BoolPtr(true)
@@ -2119,6 +2120,9 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 		if n.RateLimitBudget == "" {
 			n.RateLimitBudget = defaults.RateLimitBudget
 		}
+		if n.CacheKeySuffix == "" {
+			n.CacheKeySuffix = defaults.CacheKeySuffix
+		}
 		if len(defaults.Failsafe) > 0 {
 			if len(n.Failsafe) == 0 {
 				n.Failsafe = make([]*FailsafeConfig, len(defaults.Failsafe))
@@ -2223,6 +2227,12 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 				cp := *defaults.Evm.ServedTip
 				n.Evm.ServedTip = &cp
 			}
+			if n.Evm.BlockStore == nil && defaults.Evm.BlockStore != nil {
+				n.Evm.BlockStore = defaults.Evm.BlockStore.Copy()
+			}
+			if n.Evm.HeadTracker == nil && defaults.Evm.HeadTracker != nil {
+				n.Evm.HeadTracker = defaults.Evm.HeadTracker.Copy()
+			}
 			if n.Evm.SafeBlockSource == "" {
 				n.Evm.SafeBlockSource = defaults.Evm.SafeBlockSource
 			}
@@ -2237,6 +2247,8 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 			// flipping an `svm:`-authored network to architecture=evm.
 			n.Evm = &EvmNetworkConfig{}
 			*n.Evm = *defaults.Evm
+			n.Evm.BlockStore = defaults.Evm.BlockStore.Copy()
+			n.Evm.HeadTracker = defaults.Evm.HeadTracker.Copy()
 		}
 		if n.Svm != nil && defaults.Svm != nil {
 			mergeSvmNetworkDefaults(n.Svm, defaults.Svm)
@@ -2567,6 +2579,8 @@ func (s *SvmNetworkConfig) SetDefaults() error {
 }
 
 func (e *EvmNetworkConfig) SetDefaults() error {
+	e.BlockStore.SetDefaults()
+	e.HeadTracker.SetDefaults()
 	if e.FallbackFinalityDepth == 0 {
 		e.FallbackFinalityDepth = DefaultEvmFinalityDepth
 	}
@@ -2585,6 +2599,10 @@ func (e *EvmNetworkConfig) SetDefaults() error {
 		// Default: an empty point-lookup is retryable only for blocks at/below the
 		// latest head; a block above the head isn't produced yet → return it empty.
 		e.EmptyResultConfidence = AvailbilityConfidenceBlockHead
+	}
+	if e.FutureBlockShortCircuitMargin == nil {
+		margin := DefaultFutureBlockShortCircuitMargin
+		e.FutureBlockShortCircuitMargin = &margin
 	}
 	if e.MaxFutureBlockRetryDistance != nil {
 		log.Warn().Msg("config: evm.maxFutureBlockRetryDistance is deprecated and ignored; use evm.emptyResultConfidence (blockHead|finalizedBlock) instead")
@@ -2621,6 +2639,17 @@ func (e *EvmNetworkConfig) SetDefaults() error {
 	}
 
 	return nil
+}
+
+const DefaultFutureBlockShortCircuitMargin int64 = 16
+
+// FutureBlockMargin returns the safety distance even for network configs
+// constructed directly without passing through SetDefaults.
+func (e *EvmNetworkConfig) FutureBlockMargin() int64 {
+	if e.FutureBlockShortCircuitMargin == nil {
+		return DefaultFutureBlockShortCircuitMargin
+	}
+	return *e.FutureBlockShortCircuitMargin
 }
 
 func (i *EvmIntegrityConfig) SetDefaults() error {
