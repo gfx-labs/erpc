@@ -16,11 +16,69 @@ import (
 	"github.com/h2non/gock"
 	"github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
 func init() {
 	util.ConfigureTestLogger()
+}
+
+func TestNetworkRetry_EthCallNullWithoutRetryEmpty(t *testing.T) {
+	for _, tc := range []struct {
+		name, second string
+		wantError    bool
+	}{
+		{"fallback", "0x42", false},
+		{"all-null", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			util.ResetGock()
+			defer util.ResetGock()
+			util.SetupMocksForEvmStatePoller()
+			calls := 0
+			for i, value := range []interface{}{nil, tc.second} {
+				if tc.wantError {
+					value = nil
+				}
+				url := "http://rpc1.localhost"
+				if i == 1 {
+					url = "http://rpc2.localhost"
+				}
+				gock.New(url).Post("").Filter(func(r *http.Request) bool {
+					return strings.Contains(util.SafeReadBody(r), "eth_call")
+				}).Persist().Reply(200).Map(func(r *http.Response) *http.Response {
+					calls++
+					return r
+				}).JSON(map[string]interface{}{"jsonrpc": "2.0", "id": 1, "result": value})
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			network := setupTestNetworkForMissingDataRetry(t, ctx,
+				&common.DirectiveDefaultsConfig{RetryEmpty: util.BoolPtr(false)},
+				&common.RetryPolicyConfig{MaxAttempts: 2})
+			if tc.wantError {
+				cache := &common.MockCacheDal{}
+				cache.On("Get", mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+				network.cacheDal = cache
+				defer func() { cache.AssertNotCalled(t, "Set", mock.Anything, mock.Anything, mock.Anything) }()
+			}
+			network.PinUpstreamOrderForTest("rpc1", "rpc2")
+			req := common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0x123"},"latest"]}`))
+			req.ApplyDirectiveDefaults(network.cfg.DirectiveDefaults)
+			resp, err := network.Forward(ctx, req)
+			if tc.wantError {
+				require.Error(t, err)
+				assert.Nil(t, resp)
+			} else {
+				require.NoError(t, err)
+				jrr, jerr := resp.JsonRpcResponse()
+				require.NoError(t, jerr)
+				assert.Equal(t, `"0x42"`, jrr.GetResultString())
+			}
+			assert.GreaterOrEqual(t, calls, 2)
+		})
+	}
 }
 
 func TestNetworkRetry_MissingDataError(t *testing.T) {
