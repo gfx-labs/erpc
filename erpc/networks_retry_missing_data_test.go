@@ -783,7 +783,7 @@ func TestNetworkForward_TryAllUpstreams_AllEmpty_DelayBetweenRounds(t *testing.T
 
 		rpc1Calls := 0
 
-		// rpc1 returns null for eth_call. Empty results are success (nil error)
+		// rpc1 returns valid empty hex for eth_call. Empty results are success (nil error)
 		// so the loop returns immediately. HandleIf checks EmptyResultAccept —
 		// since eth_call is in the list, the empty result is accepted.
 		gock.New("http://rpc1.localhost").
@@ -797,7 +797,7 @@ func TestNetworkForward_TryAllUpstreams_AllEmpty_DelayBetweenRounds(t *testing.T
 			JSON(map[string]interface{}{
 				"jsonrpc": "2.0",
 				"id":      1,
-				"result":  nil,
+				"result":  "0x",
 			})
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1045,7 +1045,7 @@ func TestNetworkForward_TryAllUpstreams_MixedErrorAndEmpty(t *testing.T) {
 				"error":   map[string]interface{}{"code": -32000, "message": "Internal server error"},
 			})
 
-		// rpc2 returns empty/null (valid response, but emptyish)
+		// rpc2 returns valid empty hex data
 		gock.New("http://rpc2.localhost").
 			Post("").
 			Filter(func(r *http.Request) bool {
@@ -1057,7 +1057,7 @@ func TestNetworkForward_TryAllUpstreams_MixedErrorAndEmpty(t *testing.T) {
 			JSON(map[string]interface{}{
 				"jsonrpc": "2.0",
 				"id":      1,
-				"result":  nil,
+				"result":  "0x",
 			})
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1428,8 +1428,8 @@ func TestNetworkForward_UpstreamReselection_MissingDataSucceedsOnRetry(t *testin
 // - TestUpstreamSelection_EmptyResponses_DontBlockReselection
 // - TestUpstreamSelection_MissingDataError_DontBlockReselection
 
-func TestNetworkForward_UpstreamReselection_WrongEmptyStillTracked(t *testing.T) {
-	t.Run("Rpc1Empty_Rpc2HasData_ErrorsByUpstreamTracksEmpty", func(t *testing.T) {
+func TestNetworkForward_UpstreamReselection_NullServerErrorTracked(t *testing.T) {
+	t.Run("Rpc1Null_Rpc2HasData_ErrorsByUpstreamTracksServerError", func(t *testing.T) {
 		util.ResetGock()
 		defer util.ResetGock()
 		util.SetupMocksForEvmStatePoller()
@@ -1484,19 +1484,17 @@ func TestNetworkForward_UpstreamReselection_WrongEmptyStillTracked(t *testing.T)
 		require.NoError(t, jrrErr)
 		assert.Contains(t, jrr.GetResultString(), "0x42")
 
-		// Verify that ErrorsByUpstream still tracks that rpc1 returned empty.
-		// This is important for the "wrong empty response" metric and error reporting.
+		// The malformed null counts as an upstream server failure, not missing data.
 		emptyCount := 0
 		req.ErrorsByUpstream.Range(func(key, value interface{}) bool {
 			if err, ok := value.(error); ok {
-				if common.HasErrorCode(err, common.ErrCodeEndpointMissingData) {
+				if common.HasErrorCode(err, common.ErrCodeEndpointServerSideException) {
 					emptyCount++
 				}
 			}
 			return true
 		})
-		assert.Equal(t, 1, emptyCount,
-			"ErrorsByUpstream should track exactly 1 upstream that returned empty (for wrong-empty metric)")
+		assert.Equal(t, 1, emptyCount, "ErrorsByUpstream should track the malformed upstream")
 	})
 }
 
