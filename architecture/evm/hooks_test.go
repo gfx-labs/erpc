@@ -141,7 +141,7 @@ func TestUpstreamPostForward_UnexpectedEmpty_RetryEmptyFalse(t *testing.T) {
 func TestUpstreamPostForward_UnexpectedEmpty_NonListedMethods(t *testing.T) {
 	// Methods that should NOT trigger error conversion even with empty results
 	methods := []string{
-		"eth_call",
+		// eth_call has a dedicated null-result check, regardless of this list.
 		"eth_getBalance",
 		"eth_getCode",
 		"eth_getStorageAt",
