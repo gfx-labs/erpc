@@ -1,0 +1,97 @@
+---
+title: WebSocket
+description: Serve eth_subscribe (newHeads, logs) over WebSocket on the same URL as HTTP, fed by the Redis head cache so every subscriber shares one hydration of each block.
+---
+
+import { LLMsTxtLink, AISection, SourceLink } from "../../components";
+
+<LLMsTxtLink />
+
+# WebSocket
+
+Clients can open a WebSocket on the same URL they already use for HTTP
+(`ws://host:4000/<project>/evm/<chainId>`) to subscribe to `newHeads` and
+`logs`. Events come from the network's [head cache](/config/database/head-cache),
+so a thousand subscribers cost the same provider traffic as one, and reorgs
+arrive as `removed: true` logs. Ordinary JSON-RPC calls stay on HTTP.
+
+Disabled by default.
+
+## Quick taste
+
+```yaml
+server:
+  webSocket:
+    enabled: true
+database:
+  evmJsonRpcCache:
+    connectors:
+      - id: redis-cache
+        driver: redis
+        redis:
+          uri: redis://redis:6379
+projects:
+  - id: main
+    networks:
+      - architecture: evm
+        evm:
+          chainId: 1
+          # the upgrade requires the Redis head cache on this network
+          headCache:
+            enabled: true
+            connectorId: redis-cache
+```
+
+<AISection>
+
+## Config schema (`server.webSocket`)
+
+Defaults from `WebSocketServerConfig.SetDefaults` (<SourceLink file="common/config_headcache.go" lines="153-175" />), called from <SourceLink file="common/defaults.go" lines="793" />.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | When false, Upgrade requests are handled as plain HTTP (no 101). |
+| `maxConnections` | `1024` | Concurrent WS connections per process. Beyond it the upgrade gets HTTP 503. |
+| `maxConnectionsPerProject` | `0` (off) | Concurrent WS connections per project (0..`maxConnections`). Beyond it the upgrade gets HTTP 503, and other projects are unaffected. |
+| `maxSubscriptionsPerConnection` | `32` | Further `eth_subscribe` calls return JSON-RPC error `-32005`. |
+| `sendQueueSize` | `256` | Outbound messages queued per connection, and the head cache event queue per subscription. Notifications wait up to `writeTimeout` for space, so a large block reaches a client that keeps reading. A client stalled longer, or a head cache queue overflow, closes with 1008. |
+| `maxMessageBytes` | `1MB` (min 1024) | Inbound frame limit. Larger frames close with 1009. |
+| `writeTimeout` | `10s` | Per outbound frame. A timeout closes with 1008. |
+| `pingInterval` | `30s` | Keepalive ping and credential re-check period. `0` (unset) uses the `30s` default and a negative value fails config validation, so pings cannot be disabled. |
+
+## Behavior
+
+- **Contract.** Only `eth_subscribe` and `eth_unsubscribe` are accepted. Any other method gets `-32601` (use HTTP). A batch (top-level JSON array) gets a single `-32600`. Unparsable JSON gets `-32700`, and valid JSON that is not a request object gets `-32600`. Frames are handled sequentially per connection.
+- **Head cache required.** The upgrade gets HTTP 503 unless the network has an enabled head cache (`evm.headCache` with a Redis `connectorId`). Notifications are rendered only from cached canonical events and never trigger upstream calls. eRPC never proxies upstream WebSockets.
+- **Routing.** Same path and domain aliasing as HTTP. A connection is bound to one project and network.
+- **Auth.** Credentials (`?secret=`, `X-ERPC-Secret-Token`, `Authorization`) are taken from the upgrade request. They are checked at upgrade (401 on failure) and again for every message through the project's consumer auth. `ignoreMethods`/`allowMethods` apply.
+- **Origin.** Browsers do not apply CORS to WebSockets. When the project has `cors.allowedOrigins`, an upgrade with a non-matching `Origin` gets 403.
+- **Subscriptions.** `newHeads` emits header fields (no `transactions`, `uncles`, `size`, `totalDifficulty`, `withdrawals`) per new canonical block, ascending. `logs` accepts `address` (string or array) and `topics` (up to 4 positions, `null` wildcard, nested arrays for OR). On a reorg, orphaned matching logs are sent first with `removed: true` (highest block first), then the new canonical logs. The subscription id reply always precedes its notifications. Setup consumes project rate-limit budget for `eth_subscribe`.
+- **Tip.** The head cache publishes the seeder's verified live `eth_blockNumber` tip, so `newHeads` may briefly run ahead of or behind the HTTP served `latest`.
+- **Unsubscribe.** `eth_unsubscribe` returns `false` for ids that were not created on the same connection.
+
+## Edge cases & gotchas
+
+1. **No silent gaps.** Every head cache event is checked for continuity. Missing heights (evicted records, a window reset, recovery after staleness), a subscription queue overflow, or a stopped head cache close the connection with 1008 (`subscription gap: resubscribe` / `slow consumer`). Clients should reconnect, resubscribe and backfill with `eth_getLogs` over HTTP (`TestWs_GapDetection`, `TestWs_SlowConsumerDisconnected`).
+2. **Stale head cache.** When the head cache stops serving (see its `maxStaleness`), no events are produced.
+3. **Shutdown.** Connections are hijacked, so `http.Server.Shutdown` does not wait for them. They close with 1001 when the application context ends. New upgrades during draining get 503.
+4. `maxConnections` and `maxConnectionsPerProject` are per process, not per client IP or fleet. Front eRPC with a per-client connection limit at the load balancer.
+5. Only `newHeads` and `logs` are supported. `newPendingTransactions`, `syncing` and unknown kinds return `-32601`.
+6. **Keepalive and re-auth.** Every `pingInterval` the server pings (a missing pong within `writeTimeout` closes with 1008) and re-checks the upgrade credentials through consumer auth, consuming one auth rate-limit permit when the strategy has a `rateLimitBudget`. A revoked key or expired JWT stops streaming within about one `pingInterval`, closing with 1008 `unauthorized`.
+7. **Server timeouts.** Upgraded connections are hijacked, so they outlive `server.writeTimeout` (`TestWs_OutlivesHTTPWriteTimeout`).
+8. **Fork compatibility.** Configs written for the unmerged fork branch must drop `server.webSocket.maxInflightPerConnection` and `maxBatchSize`. Those keys no longer exist.
+
+## Observability
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `erpc_ws_connections` | gauge | `project`, `network` | Open connections. |
+| `erpc_ws_subscriptions` | gauge | `project`, `network`, `kind` | Active subscriptions (`newHeads`, `logs`). |
+| `erpc_ws_notifications_total` | counter | `project`, `network`, `kind` | `eth_subscription` notifications sent. |
+| `erpc_ws_connections_closed_total` | counter | `project`, `network`, `reason` | Closed connections: `client`, `slow_consumer`, `shutdown`, `error`. |
+
+Defined in <SourceLink file="telemetry/feature_metrics.go" /> and emitted from <SourceLink file="erpc/ws_server.go" />. Panics are counted in `erpc_unexpected_panic_total` with scope `ws-handler` / `ws-message`. No upstream requests are made from a WebSocket connection.
+
+Tests: `TestWs_UnsupportedContract`, `TestWs_SingleInvalidRequestCodes`, `TestWs_DisabledAndNoHeadCache`, `TestWs_Caps`, `TestWs_PerProjectCap`, `TestWs_SubscriptionsReorg`, `TestWs_GapDetection`, `TestWs_PingAndReauthClosesExpiredJwt`, `TestWs_ConfigFallbacks`.
+
+</AISection>

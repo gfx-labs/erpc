@@ -1,0 +1,107 @@
+# Venn-parity example: an indexer-facing eRPC fleet with several replicas.
+#
+# Two required components:
+#   - evm.headCache: one replica per network holds a Redis lease, hydrates recent
+#     canonical blocks + logs, and every replica serves them. It reuses a Redis
+#     connector from database.evmJsonRpcCache.connectors (connectorId).
+#   - server.webSocket: eth_subscribe newHeads/logs fed by the head cache.
+#     Only eth_subscribe / eth_unsubscribe are accepted over WS.
+# Optional, existing config only:
+#   - selectionPolicy.evalFunc sorts cheap upstreams first, and the network
+#     failsafe has no hedge, so client requests are forwarded to paid only
+#     after a cheap failure or when no cheap upstream is eligible (cordoned,
+#     excluded or unsupported). This does not cover background
+#     traffic: state pollers (eth_blockNumber, finalized, syncing) and
+#     selection probes still call paid on their own schedule.
+#
+# Validated by the Go config loader (common/venn_parity_example_test.go). It does
+# not claim any provider-cost saving. Measure with the metrics listed in the docs.
+#
+# Environment variables (expanded by the loader):
+#   REDIS_URL           redis://host:6379/0 used by the cache and head cache
+#   CHEAP_RPC_URL       self-hosted / flat-rate node
+#   CHEAP2_RPC_URL      second cheap node
+#   PAID_RPC_URL        metered vendor used only as fallback
+
+logLevel: info
+
+server:
+  httpHostV4: 0.0.0.0
+  httpPort: 4000
+  webSocket:
+    enabled: true
+    # Per process, not per fleet. Put a per-client connection limit in front.
+    maxConnections: 1024
+    maxSubscriptionsPerConnection: 32
+    # A client that falls this far behind is disconnected (1008), never buffered unbounded.
+    sendQueueSize: 256
+
+metrics:
+  enabled: true
+  hostV4: 0.0.0.0
+  port: 4001
+
+database:
+  evmJsonRpcCache:
+    connectors:
+      # Also referenced by evm.headCache.connectorId below.
+      - id: redis-cache
+        driver: redis
+        redis:
+          uri: ${REDIS_URL}
+    policies:
+      - connector: redis-cache
+        network: "*"
+        method: "*"
+        finality: finalized
+        ttl: 0
+
+projects:
+  - id: main
+    networks:
+      - architecture: evm
+        evm:
+          chainId: 1
+          headCache:
+            enabled: true
+            # Must name a redis connector in database.evmJsonRpcCache.connectors.
+            connectorId: redis-cache
+            # Memory is per network per replica. Size pod limits for
+            # maxBytes x enabled networks, plus Go overhead.
+            depth: 128
+            maxBytes: 268435456
+        # Optional: cheap upstreams first, paid last. Existing selection policy.
+        selectionPolicy:
+          evalFunc: |
+            (upstreams, ctx) =>
+              upstreams
+                .removeCordoned()
+                .sortBy(u => u.id === 'paid' ? 1 : 0)
+        # For client forwarding, paid is used only after a cheap failure or
+        # when no cheap upstream is eligible. A failed eval (script error, timeout) keeps
+        # the previous order. If the policy has never evaluated successfully
+        # (cold start), requests fall back to the upstreams list order, so keep
+        # paid listed last below.
+        failsafe:
+          - matchMethod: "*"
+            timeout:
+              duration: 30s
+            # Explicitly off: a hedge is a speculative extra (possibly paid) call.
+            hedge: null
+            retry:
+              maxAttempts: 2
+              delay: 100ms
+
+    upstreams:
+      - id: cheap-1
+        endpoint: ${CHEAP_RPC_URL}
+        evm:
+          chainId: 1
+      - id: cheap-2
+        endpoint: ${CHEAP2_RPC_URL}
+        evm:
+          chainId: 1
+      - id: paid
+        endpoint: ${PAID_RPC_URL}
+        evm:
+          chainId: 1
