@@ -10,9 +10,6 @@ on:
       version_tag:
         description: 'Version tag for the release (e.g., 1.0.0)'
         required: true
-  push:
-    branches:
-      - main
 
 permissions: read-all
 
