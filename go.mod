@@ -2,7 +2,7 @@ module github.com/erpc/erpc
 
 go 1.25.1
 
-toolchain go1.25.3
+toolchain go1.27.3
 
 require (
 	github.com/DataDog/sketches-go v1.4.8
