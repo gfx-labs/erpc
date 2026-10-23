@@ -161,6 +161,11 @@ type ServerConfig struct {
 	TrustedIPHeaders    []string          `yaml:"trustedIPHeaders,omitempty" json:"trustedIPHeaders"`
 	ResponseHeaders     map[string]string `yaml:"responseHeaders,omitempty" json:"responseHeaders"`
 
+	// WebSocket opts into the JSON-RPC WebSocket endpoint (eth_subscribe
+	// newHeads/logs reconstructed from HTTP upstreams). Nil or disabled keeps
+	// the server HTTP-only. See WebSocketServerConfig.
+	WebSocket *WebSocketServerConfig `yaml:"webSocket,omitempty" json:"webSocket,omitempty"`
+
 	// ExecutionHeaders controls the per-request diagnostic headers
 	// (X-ERPC-Attempts, X-ERPC-Upstreams-Tried, etc.) that expose how
 	// eRPC routed and resolved each request. Defaults to "all" — set
@@ -403,6 +408,11 @@ type GrpcConnectorConfig struct {
 	// connection, at the cost of more open connections per server. When unset
 	// (0) a built-in default is used.
 	PoolSize int `yaml:"poolSize,omitempty" json:"poolSize"`
+
+	// HealthCheckService is a grpc.health.v1 service name. When set, each
+	// connection watches it on every resolved address and sends requests only
+	// to addresses reporting SERVING. Empty (default) disables health checking.
+	HealthCheckService string `yaml:"healthCheckService,omitempty" json:"healthCheckService"`
 }
 
 type MemoryConnectorConfig struct {
@@ -709,6 +719,7 @@ type NetworkDefaults struct {
 	Evm               *EvmNetworkConfig        `yaml:"evm,omitempty" json:"evm" tstype:"TsEvmNetworkConfigForDefaults"`
 	Svm               *SvmNetworkConfig        `yaml:"svm,omitempty" json:"svm" tstype:"TsSvmNetworkConfigForDefaults"`
 	Multiplexing      *bool                    `yaml:"multiplexing,omitempty" json:"multiplexing"`
+	CacheKeySuffix    string                   `yaml:"cacheKeySuffix,omitempty" json:"cacheKeySuffix"`
 }
 
 // UnmarshalYAML provides backward compatibility for old single failsafe object format
@@ -742,6 +753,7 @@ func (n *NetworkDefaults) UnmarshalYAML(unmarshal func(interface{}) error) error
 		DirectiveDefaults *DirectiveDefaultsConfig `yaml:"directiveDefaults,omitempty"`
 		Evm               *EvmNetworkConfig        `yaml:"evm,omitempty"`
 		Svm               *SvmNetworkConfig        `yaml:"svm,omitempty"`
+		CacheKeySuffix    string                   `yaml:"cacheKeySuffix,omitempty"`
 	}
 
 	var old oldNetworkDefaults
@@ -753,6 +765,7 @@ func (n *NetworkDefaults) UnmarshalYAML(unmarshal func(interface{}) error) error
 
 	// Convert old format to new format
 	n.RateLimitBudget = old.RateLimitBudget
+	n.CacheKeySuffix = old.CacheKeySuffix
 	n.SelectionPolicy = old.SelectionPolicy
 	n.DirectiveDefaults = old.DirectiveDefaults
 	n.Evm = old.Evm
@@ -1286,6 +1299,9 @@ type GrpcUpstreamConfig struct {
 	// upstream, selected round-robin per request. See GrpcConnectorConfig.PoolSize.
 	// When unset (0) a built-in default is used.
 	PoolSize int `yaml:"poolSize,omitempty" json:"poolSize"`
+
+	// HealthCheckService: see GrpcConnectorConfig.HealthCheckService.
+	HealthCheckService string `yaml:"healthCheckService,omitempty" json:"healthCheckService"`
 }
 
 func (c *GrpcUpstreamConfig) Copy() *GrpcUpstreamConfig {
@@ -2259,6 +2275,10 @@ type NetworkConfig struct {
 	// Integrity overrides the project-wide data-integrity configuration for this
 	// network. Merges over the project block (network wins).
 	Integrity *IntegrityConfig `yaml:"integrity,omitempty" json:"integrity,omitempty"`
+	// CacheKeySuffix, when set, is inserted into the JSON-RPC cache partition
+	// key as {networkId}:{suffix}:{blockRef} so two networks that share a
+	// chainId (and a Redis) do not collide. Empty keeps {networkId}:{blockRef}.
+	CacheKeySuffix string `yaml:"cacheKeySuffix,omitempty" json:"cacheKeySuffix"`
 }
 
 // StaticResponseConfig declares a canned JSON-RPC response for a specific
@@ -2329,6 +2349,7 @@ func (n *NetworkConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		Alias             string                   `yaml:"alias,omitempty"`
 		Methods           *MethodsConfig           `yaml:"methods,omitempty"`
 		StaticResponses   []*StaticResponseConfig  `yaml:"staticResponses,omitempty"`
+		CacheKeySuffix    string                   `yaml:"cacheKeySuffix,omitempty"`
 	}
 
 	var old oldNetworkConfig
@@ -2348,6 +2369,7 @@ func (n *NetworkConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	n.Alias = old.Alias
 	n.Methods = old.Methods
 	n.StaticResponses = old.StaticResponses
+	n.CacheKeySuffix = old.CacheKeySuffix
 
 	if old.Failsafe != nil {
 		// Ensure MatchMethod has a default value for backward compatibility
@@ -2586,12 +2608,30 @@ type EvmNetworkConfig struct {
 	//   - finalizedBlock: stricter — only retry empties for blocks at/below the
 	//     finalized head; an unfinalized block's empty is treated as not-yet-confirmed.
 	EmptyResultConfidence AvailbilityConfidence `yaml:"emptyResultConfidence,omitempty" json:"emptyResultConfidence,omitempty"`
+	// FutureBlockShortCircuitMargin is the number of blocks above the observed
+	// head still forwarded upstream. Negative disables the short-circuit.
+	// Nil defaults to 16: four seconds of tracker lag even on 250ms chains,
+	// and ample room for the usual one-block lag on 2s chains.
+	FutureBlockShortCircuitMargin *int64 `yaml:"futureBlockShortCircuitMargin,omitempty" json:"futureBlockShortCircuitMargin,omitempty"`
 
 	// SafeBlockSource is an upstream id/tag selector for standard JSON-RPC
 	// requests carrying the `safe` block tag. Matching upstreams define and
 	// serve `safe`; empty (without an inherited network default) keeps existing
 	// provider-defined routing. This does not affect eth_query* or gRPC Query.
 	SafeBlockSource string `yaml:"safeBlockSource,omitempty" json:"safeBlockSource,omitempty"`
+
+	// BlockStore opts into the head-driven full-block/log cache: a Redis-shared,
+	// parent-hash-verified window of recent canonical blocks (with their
+	// logs) hydrated from upstreams as the head advances. It serves
+	// eth_getBlockByNumber/ByHash and eth_getLogs when fully covered and
+	// feeds WebSocket subscriptions. Nil or disabled changes nothing.
+	BlockStore *EvmBlockStoreConfig `yaml:"blockStore,omitempty" json:"blockStore,omitempty"`
+
+	// HeadTracker opts into the fleet-wide head tracker: one elected replica
+	// polls eth_getBlockByNumber("latest") once per block and publishes the head
+	// through shared state; every replica serves it as "latest". Nil or
+	// disabled changes nothing. See EvmHeadTrackerConfig.
+	HeadTracker *EvmHeadTrackerConfig `yaml:"headTracker,omitempty" json:"headTracker,omitempty"`
 
 	// Deprecated: replaced by EmptyResultConfidence (blockHead). Retained as a yaml-only
 	// key so existing configs keep loading; SetDefaults warns and ignores it. The old
@@ -3024,8 +3064,8 @@ type MetricsConfig struct {
 type MetricCustomizationAction string
 
 const (
-	MetricActionKeep MetricCustomizationAction = telemetry.ActionKeep
-	MetricActionDrop MetricCustomizationAction = telemetry.ActionDrop
+	MetricActionKeep MetricCustomizationAction = "keep"
+	MetricActionDrop MetricCustomizationAction = "drop"
 )
 
 // MetricsCustomizationConfig is one entry of metrics.customizations: a subject
@@ -3146,6 +3186,15 @@ type RateLimitStoreConfig struct {
 	Redis          *RedisConnectorConfig `yaml:"redis,omitempty" json:"redis,omitempty"`
 	CacheKeyPrefix string                `yaml:"cacheKeyPrefix,omitempty" json:"cacheKeyPrefix"`
 	NearLimitRatio float32               `yaml:"nearLimitRatio,omitempty" json:"nearLimitRatio"`
+}
+
+// CachePartitionKey builds the JSON-RPC cache partition key.
+// Empty suffix keeps {networkId}:{ref}; a set suffix yields {networkId}:{suffix}:{ref}.
+func CachePartitionKey(networkId, suffix, ref string) string {
+	if suffix == "" {
+		return networkId + ":" + ref
+	}
+	return networkId + ":" + suffix + ":" + ref
 }
 
 func (c *NetworkConfig) NetworkId() string {

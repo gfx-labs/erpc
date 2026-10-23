@@ -1,10 +1,32 @@
 package evm
 
 import (
+	"bytes"
 	"context"
+	"errors"
 
 	"github.com/erpc/erpc/common"
 )
+
+// A null eth_call result violates the JSON-RPC method contract (hex DATA is
+// required, including for empty output). Use a server-side endpoint exception
+// rather than MissingData: the latter is gated by RetryEmpty=false at both
+// failsafe scopes, while this malformed response must penalize the upstream
+// and retry toward another one regardless of that directive.
+func upstreamPostForward_eth_call(ctx context.Context, rq *common.NormalizedRequest, rs *common.NormalizedResponse, re error) (*common.NormalizedResponse, error) {
+	if re != nil || rs == nil {
+		return rs, re
+	}
+	jrr, err := rs.JsonRpcResponse(ctx)
+	if err != nil || jrr == nil || jrr.Error != nil || !bytes.Equal(bytes.TrimSpace(jrr.GetResultBytes()), []byte("null")) {
+		return rs, re
+	}
+	// Do not retain the malformed response: the network retry loop can otherwise
+	// promote a non-nil response from a failed attempt to its best response.
+	// Upstream.Forward stored it as last-valid before this post-forward check.
+	rq.ClearLastValidResponseIf(rs)
+	return nil, common.NewErrEndpointServerSideException(errors.New("upstream returned null for eth_call instead of hex DATA"), nil, 0)
+}
 
 // upstreamPostForward_markUnexpectedEmpty converts empty results for point-lookups
 // (blocks, transactions, receipts, traces, etc.) to missing-data so network retry can rotate.
@@ -25,10 +47,8 @@ func upstreamPostForward_markUnexpectedEmpty(
 		}
 	}
 
-	// Confidence guard: do not retry an empty result for a concrete block beyond the
-	// network's required confidence head (latest by default, or finalized) — it isn't
-	// confirmed yet, so every upstream legitimately returns empty. Return the truthful
-	// empty instead of churning retries until the request times out.
+	// Confidence guard: beyond the head plus the configured safety margin, an
+	// empty is likely truthful. Near-tip empties may be from a lagging upstream.
 	if emptyResultBeyondConfidence(ctx, rq) {
 		return rs, re
 	}
@@ -53,9 +73,8 @@ func upstreamPostForward_markUnexpectedEmpty(
 }
 
 // emptyResultBeyondConfidence reports whether `rq` targets a concrete block number
-// beyond the network's required confidence head — i.e. not yet confirmed enough for an
-// empty result to mean "missing data" rather than "not produced/finalized yet", so
-// every upstream legitimately returns empty. The head is the latest head for
+// beyond the network's required confidence head plus its safety margin. The
+// head is the latest head for
 // EmptyResultConfidence=blockHead (the default) or the finalized head for
 // finalizedBlock. Returns false (fail-open) when the head is unknown or the request
 // does not target a concrete numeric block (tags and block-hash lookups never qualify).
@@ -85,7 +104,8 @@ func emptyResultBeyondConfidence(ctx context.Context, rq *common.NormalizedReque
 		// Fail open: without a known head we cannot tell beyond-confidence from behind.
 		return false
 	}
-	return bn > head
+	margin := cfg.Evm.FutureBlockMargin()
+	return margin >= 0 && bn > head && bn-head > margin
 }
 
 // normalizeEmptyArrayResponse returns a new NormalizedResponse with result `[]`,
