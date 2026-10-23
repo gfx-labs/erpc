@@ -12,8 +12,6 @@
 name: gfx blockstore-historical image
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       ref:
