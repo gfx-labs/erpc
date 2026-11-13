@@ -5,6 +5,9 @@ module.exports = {
 	"websocket": {
 		title: "WebSocket",
 	},
+	"leader-fetch": {
+		title: "Leader fetch",
+	},
 	"healthcheck": {
 		title: "Healthcheck",
 	},

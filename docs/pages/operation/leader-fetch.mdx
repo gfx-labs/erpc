@@ -1,0 +1,158 @@
+---
+title: Leader fetch
+description: Run many eRPC replicas and pay for one head fetch per block, not one per replica.
+---
+
+import { LLMsTxtLink, AISection, ConfigTabs, PromptExample } from "../../components";
+
+<LLMsTxtLink />
+
+# Leader fetch
+
+Every eRPC replica follows the chain head on its own: each one asks your providers for the
+latest block about once per block. With ten replicas, that's ten head fetches per block.
+Leader fetch lets one replica per network do it for the whole fleet and share each head with
+the others through shared state, so the head-fetch bill stays flat as you scale out. If that
+replica dies, another takes over within seconds, and in the meantime every replica goes back
+to fetching on its own.
+
+It is **off by default** and needs a shared-state connector that every replica reaches
+(Redis).
+
+## Quick taste
+
+<ConfigTabs
+  path="projects[].networks[].evm.chainTracker.leaderFetch"
+  focusYaml="7-9"
+  focusTs="6-7"
+  yaml={`projects:
+  - id: main
+    networks:
+      - architecture: evm
+        evm:
+          chainId: 1
+          chainTracker:
+            # one replica fetches heads for the whole fleet
+            leaderFetch: { enabled: true }`}
+  ts={`projects: [{
+  id: "main",
+  networks: [{
+    architecture: "evm",
+    evm: { chainId: 1, chainTracker: {
+      // one replica fetches heads for the whole fleet
+      leaderFetch: { enabled: true },
+    } },
+  }],
+}]`}
+/>
+
+## Agent reference
+
+<PromptExample
+	n={1}
+	title="cut head-fetch cost across replicas"
+	defaultOpen
+	prompt={`I run several eRPC replicas behind a load balancer and my providers bill every
+eth_getBlockByNumber("latest") call. Turn on leader fetch for my EVM networks so one replica
+fetches heads for all of them, make sure my shared state is a connector that supports it, and
+tell me which metrics prove it works. Work with my existing eRPC config. Reference:
+https://docs.erpc.cloud/operation/leader-fetch.llms.txt`}
+/>
+
+<PromptExample
+	n={2}
+	title="tune failover"
+	prompt={`Explain how fast my eRPC fleet recovers when the leader fetch replica dies, and
+tune leaseTtl and minStaleAfter in my eRPC config for a chain with 12s blocks. Reference:
+https://docs.erpc.cloud/operation/leader-fetch.llms.txt`}
+/>
+
+<AISection
+	title="Leader fetch — full agent reference"
+	hint="Schema, trust tradeoff, failover bounds, metrics and source links."
+>
+
+### How it works
+
+Each network with `evm.chainTracker.leaderFetch.enabled: true` runs one goroutine per
+replica (`leaderFetch.run`, `erpc/network_leader_fetch.go`). It subscribes to the
+network's channel on the shared-state connector and, every `leaseTtl / 3`, either renews
+the lease it holds or tries to take it (`SET NX PX` of a random token).
+
+- **Leader** (lease holder): its chain tracker's block clock runs exactly as without the
+  feature (spec §6.8). Every header that one of its own fetches of an upstream's `latest`
+  brought, and that its intake passed (integrity, chain identity), is published on the
+  channel with the upstream id and the lease's **fencing epoch**.
+- **Follower**: takes each published header through its **own intake** as that upstream's
+  vote, as kind `HeaderLeader`: integrity checks, chain-identity gating, head counter and
+  hash vote all run locally, and the tracker links it by parent hash like any other vote.
+  To the block clock it arrives as a push, and it meets the upstream's own poll's latest
+  part as a push does. While the newest accepted leader header is younger than
+  `staleAfter = max(3 × block time, minStaleAfter)`, the follower's block clock fetches
+  nothing (`ChainTracker.followsLeader`); it looks again when that time passes.
+- **Demand**: a follower whose clock has demand (reads of latest, taps) sends a demand
+  message at most every W/2; the leader marks its lanes read on it, so its clock runs for
+  readers it does not serve itself.
+- **Fencing**: each acquisition increments a never-expiring epoch counter in the same
+  script that takes the lease. Followers drop headers whose epoch is below the highest they
+  saw; a leader that sees a higher epoch stands down.
+
+Cost: the cluster's `latest` fetches are about one leader's, ~1 per block plus the clock's
+budget (spec §6.8), whatever the replica count. Upstreams' full polls (finalized, syncing)
+still run on every replica at `statePollerInterval`.
+
+### Trust tradeoff
+
+The chain tracker's rule is that a hash vote comes only from this instance's own fetches
+(spec §6.3). Leader fetch is an explicit opt-in relaxation: a follower's votes come from
+another replica's fetches, relayed through shared state. What still holds: every relayed
+header passes the follower's own integrity and chain-identity checks, its parent-hash
+linkage decides the pins, and a deposed leader's late headers are fenced. What you trust
+additionally: that the replica holding the lease is one of yours and your shared state is
+not writable by others.
+
+### Config schema
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `evm.chainTracker.leaderFetch` | object | unset (off) | Unset or `enabled: false`: every replica runs its own clock, no behaviour change. |
+| `leaderFetch.enabled` | bool | `false` | Needs a shared-state connector with leases and fan-out (`redis`; `memory` works within one process). Any other connector logs a warning and the network runs its own clock. |
+| `leaderFetch.leaseTtl` | Duration | `3s` ([`DefaultLeaderFetchLeaseTtl`](https://github.com/erpc/erpc/blob/main/common/defaults.go#L2736)) | A dead leader is replaced within it plus one pass (`leaseTtl / 3`). Minimum `100ms`. |
+| `leaderFetch.minStaleAfter` | Duration | `5s` ([`DefaultLeaderFetchMinStaleAfter`](https://github.com/erpc/erpc/blob/main/common/defaults.go#L2740)) | Floor of a follower's wait for the leader's next head before its own clock runs: `max(3 × block time, minStaleAfter)`. |
+
+### Edge cases & gotchas
+
+1. **Leader death**: a crashed leader stops renewing; its lease expires after `leaseTtl` and
+   the next pass of another replica takes it (tested: `TestLeaderFetch_LeaderDeathHandsOver`,
+   600ms handover at `leaseTtl: 600ms`). A graceful shutdown releases the lease at once.
+2. **Silent leader** (lease held, headers lost): followers run their own clocks once the
+   last header is `staleAfter` old (`TestLeaderFetch_StaleLeaderFallsBack`).
+3. **Renew error** (shared state unreachable): the leader stands down rather than risk two
+   leaders; followers fall back after `staleAfter`.
+4. **Rejected header** (integrity, chain identity, unknown upstream id): counted, not voted,
+   and does not refresh `staleAfter`, so a leader whose headers keep failing a follower's
+   intake leaves it on its own clock.
+5. **Push sources** (`ws`/`wss` with `newHeads`) still push to every replica; leader fetch
+   only replaces the block clock's polling.
+6. **Disabled** (`TestLeaderFetch_DisabledEveryInstanceFetches`): no goroutine, no channel,
+   no lease; the clock's code path is unchanged.
+
+### Observability
+
+- `erpc_leader_fetch_role{project,network}`: 1 while this replica leads, else 0. Sum across
+  replicas should be 1.
+- `erpc_leader_fetch_transitions_total{project,network,event}`: `acquired`, `lost`.
+- `erpc_leader_fetch_heads_total{project,network,outcome}`: leader `published`,
+  `publish_failed`; follower `accepted`, `rejected`, `fenced`, `malformed`,
+  `unknown_upstream`.
+- `erpc_head_clock_total` on followers stays near zero while they follow.
+
+### Source code entry points
+
+- `erpc/network_leader_fetch.go`: lease loop, publish, follower intake, staleness.
+- `architecture/evm/head_clock.go`: `followsLeader`, the clock's gate.
+- `data/shared_state_lease.go`, `data/shared_state_blob.go`: lease with fencing epoch, fan-out.
+- `common/config.go`: `EvmLeaderFetchConfig`.
+- `erpc/network_leader_fetch_test.go`: cluster cost, handover, fallback, disabled tests.
+
+</AISection>
