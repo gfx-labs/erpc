@@ -3222,6 +3222,34 @@ type EvmChainTrackerConfig struct {
 	// MaxBackfill is how much chain time, compared on header timestamps, the
 	// network-wide tracker holds for resumable taps (default 5m).
 	MaxBackfill Duration `yaml:"maxBackfill,omitempty" json:"maxBackfill,omitempty" tstype:"Duration"`
+	// LeaderFetch, when enabled, lets one instance per network (the holder
+	// of a shared-state lease) run the block clock's head fetches and
+	// publish each head it accepts to every other instance, which take it
+	// as that upstream's vote instead of fetching it themselves. Nil or
+	// disabled: every instance runs its own clock (default).
+	LeaderFetch *EvmLeaderFetchConfig `yaml:"leaderFetch,omitempty" json:"leaderFetch,omitempty"`
+}
+
+// EvmLeaderFetchConfig configures the leader fetch (evm.chainTracker.leaderFetch).
+//
+// Tradeoff: a follower's hash votes then come from another instance's
+// fetches, relayed through shared state, not only its own (an opt-in
+// relaxation of the chain tracker's trust rule). Each relayed header still
+// passes the follower's own intake: integrity, chain identity, and the
+// parent-hash linkage of its pins. Fencing tokens drop a deposed leader's
+// late heads.
+type EvmLeaderFetchConfig struct {
+	// Enabled turns the leader fetch on. Default false. Needs a shared-state
+	// connector that grants leases and fans out messages (memory, redis);
+	// with any other the network logs a warning and runs its own clock.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled"`
+	// LeaseTtl is how long a leader's lease lives without renewal: a dead
+	// leader is replaced within it. Default 3s.
+	LeaseTtl Duration `yaml:"leaseTtl,omitempty" json:"leaseTtl,omitempty" tstype:"Duration"`
+	// MinStaleAfter is the floor of how long a follower waits for the
+	// leader's next head before it runs its own clock again: max(3 x block
+	// time, MinStaleAfter). Default 5s.
+	MinStaleAfter Duration `yaml:"minStaleAfter,omitempty" json:"minStaleAfter,omitempty" tstype:"Duration"`
 }
 
 // EvmServedTipConfig controls how the network derives the "latest"/"finalized"

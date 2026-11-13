@@ -2370,6 +2370,10 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 			}
 			if n.Evm.ChainTracker == nil && defaults.Evm.ChainTracker != nil {
 				cp := *defaults.Evm.ChainTracker
+				if cp.LeaderFetch != nil {
+					lf := *cp.LeaderFetch
+					cp.LeaderFetch = &lf
+				}
 				n.Evm.ChainTracker = &cp
 			}
 			if n.Evm.SafeBlockSource == "" {
@@ -2720,6 +2724,28 @@ func (c *EvmChainTrackerConfig) SetDefaults() {
 	}
 	if c.MaxBackfill == 0 {
 		c.MaxBackfill = Duration(5 * time.Minute)
+	}
+	if c.LeaderFetch != nil {
+		lf := *c.LeaderFetch
+		lf.SetDefaults()
+		c.LeaderFetch = &lf
+	}
+}
+
+// DefaultLeaderFetchLeaseTtl bounds a dead leader's replacement.
+const DefaultLeaderFetchLeaseTtl = 3 * time.Second
+
+// DefaultLeaderFetchMinStaleAfter is the floor of a follower's wait for
+// the leader's next head.
+const DefaultLeaderFetchMinStaleAfter = 5 * time.Second
+
+// SetDefaults fills leaseTtl (3s) and minStaleAfter (5s).
+func (c *EvmLeaderFetchConfig) SetDefaults() {
+	if c.LeaseTtl == 0 {
+		c.LeaseTtl = Duration(DefaultLeaderFetchLeaseTtl)
+	}
+	if c.MinStaleAfter == 0 {
+		c.MinStaleAfter = Duration(DefaultLeaderFetchMinStaleAfter)
 	}
 }
 

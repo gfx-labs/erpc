@@ -2032,6 +2032,17 @@ func (e *EvmNetworkConfig) Validate() error {
 		if ct.MaxBackfill < 0 {
 			return fmt.Errorf("network.*.evm.chainTracker.maxBackfill must be >= 0")
 		}
+		if lf := ct.LeaderFetch; lf != nil {
+			if lf.LeaseTtl < 0 {
+				return fmt.Errorf("network.*.evm.chainTracker.leaderFetch.leaseTtl must be >= 0")
+			}
+			if lf.LeaseTtl > 0 && lf.LeaseTtl.Duration() < 100*time.Millisecond {
+				return fmt.Errorf("network.*.evm.chainTracker.leaderFetch.leaseTtl must be at least 100ms")
+			}
+			if lf.MinStaleAfter < 0 {
+				return fmt.Errorf("network.*.evm.chainTracker.leaderFetch.minStaleAfter must be >= 0")
+			}
+		}
 	}
 	if e.SafeBlockSource != "" {
 		if err := ValidatePattern(e.SafeBlockSource); err != nil {
