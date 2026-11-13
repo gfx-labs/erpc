@@ -139,11 +139,11 @@ type Network struct {
 	intake       *networkIntake
 	// leader is the opt-in leader fetch (evm.chainTracker.leaderFetch), nil
 	// when off.
-	leader *leaderFetch
-	sources      *sourceReconciler
-	taps         *indexer.Taps
-	mempool      *mempool.Feed
-	bg           util.Goroutines
+	leader  *leaderFetch
+	sources *sourceReconciler
+	taps    *indexer.Taps
+	mempool *mempool.Feed
+	bg      util.Goroutines
 }
 
 // wait waits, once the app ctx ended, until no goroutine of the network's
