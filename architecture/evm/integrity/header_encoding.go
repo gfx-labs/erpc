@@ -94,14 +94,21 @@ func sameBytes(fields map[string]json.RawMessage, a, b string) bool {
 // any other key go-ethereum does not encode.
 func gethHeaderHash(fields map[string]json.RawMessage, derived ...string) (string, bool) {
 	std := make(map[string]json.RawMessage, len(fields))
+	known := 0
 	for k, v := range fields {
 		if _, ok := knownBlockFields[k]; ok {
-			std[k] = v
+			known++
+			// The RPC-only keys (the whole transactions array among them)
+			// are no header field, so the decoder below would only skip
+			// them: leave them out rather than re-encode the block body.
+			if !slices.Contains(rpcOnlyBlockKeys, k) {
+				std[k] = v
+			}
 		} else if !slices.Contains(derived, k) {
 			return "", false
 		}
 	}
-	if len(fields)-len(std) != len(derived) {
+	if len(fields)-known != len(derived) {
 		return "", false
 	}
 	raw, err := json.Marshal(std)
