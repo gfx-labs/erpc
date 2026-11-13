@@ -2372,6 +2372,10 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 				cp := *defaults.Evm.ChainTracker
 				n.Evm.ChainTracker = &cp
 			}
+			if n.Evm.BlockStore == nil && defaults.Evm.BlockStore != nil {
+				cp := *defaults.Evm.BlockStore
+				n.Evm.BlockStore = &cp
+			}
 			if n.Evm.SafeBlockSource == "" {
 				n.Evm.SafeBlockSource = defaults.Evm.SafeBlockSource
 			}
@@ -2760,6 +2764,11 @@ func (e *EvmNetworkConfig) SetDefaults() error {
 	}
 	if err := e.Integrity.SetDefaults(); err != nil {
 		return err
+	}
+	if e.BlockStore != nil {
+		cp := *e.BlockStore
+		e.BlockStore = &cp
+		e.BlockStore.SetDefaults()
 	}
 
 	// Defaults for network-level getLogs controls

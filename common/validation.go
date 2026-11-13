@@ -2033,6 +2033,9 @@ func (e *EvmNetworkConfig) Validate() error {
 			return fmt.Errorf("network.*.evm.chainTracker.maxBackfill must be >= 0")
 		}
 	}
+	if err := e.BlockStore.Validate(); err != nil {
+		return err
+	}
 	if e.SafeBlockSource != "" {
 		if err := ValidatePattern(e.SafeBlockSource); err != nil {
 			return fmt.Errorf("network.*.evm.safeBlockSource has invalid selector %q: %w", e.SafeBlockSource, err)

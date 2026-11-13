@@ -3206,6 +3206,11 @@ type EvmNetworkConfig struct {
 	// serve `safe`; empty (without an inherited network default) keeps existing
 	// provider-defined routing. This does not affect eth_query* or gRPC Query.
 	SafeBlockSource string `yaml:"safeBlockSource,omitempty" json:"safeBlockSource,omitempty"`
+	// BlockStore shares the chain tracker's block headers and receipts
+	// across replicas through a cache connector, serves small eth_getLogs
+	// ranges from them, and keeps finalized blocks for catch-up readers.
+	// Nil or disabled: no behaviour change.
+	BlockStore *EvmBlockStoreConfig `yaml:"blockStore,omitempty" json:"blockStore,omitempty"`
 
 	// Deprecated: replaced by EmptyResultConfidence (blockHead). Retained as a yaml-only
 	// key so existing configs keep loading; SetDefaults warns and ignores it. The old
