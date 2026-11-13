@@ -40,6 +40,13 @@ type SharedStateRegistry interface {
 	GetLockTtl() time.Duration
 	GetFallbackTimeout() time.Duration
 	GetUpdateMaxWait() time.Duration
+	// Connector is the shared-state connector, for state that is no
+	// counter (leases, the leader fetch's published heads).
+	Connector() Connector
+	// ClusterKey namespaces every key of this registry.
+	ClusterKey() string
+	// InstanceId identifies this instance in what it writes (diagnostics).
+	InstanceId() string
 	// Wait waits, once appCtx ended, until no counter refresh runs (each
 	// runs its caller's fetch, at most its fallback timeout); none starts
 	// after.
@@ -287,3 +294,9 @@ func (r *sharedStateRegistry) GetFallbackTimeout() time.Duration {
 func (r *sharedStateRegistry) GetUpdateMaxWait() time.Duration {
 	return r.updateMaxWait
 }
+
+func (r *sharedStateRegistry) Connector() Connector { return r.connector }
+
+func (r *sharedStateRegistry) ClusterKey() string { return r.clusterKey }
+
+func (r *sharedStateRegistry) InstanceId() string { return r.instanceId }

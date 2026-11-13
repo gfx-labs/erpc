@@ -28,6 +28,8 @@ type MemoryConnector struct {
 	logger      *zerolog.Logger
 	cache       *ristretto.Cache[string, []byte]
 	locks       sync.Map // map[string]*sync.Mutex
+	leases      memoryLeases
+	blobs       memoryBlobBus
 	emitMetrics bool
 
 	// hashIndex tracks keys written via Set so admin purge can iterate
