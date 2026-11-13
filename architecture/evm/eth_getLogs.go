@@ -403,6 +403,14 @@ func networkPreForward_eth_getLogs(ctx context.Context, n common.Network, ups []
 	if sentAsTag {
 		return false, nil, nil
 	}
+	// The block store's logs fill (opt-in): a small explicit range the
+	// chain tracker pins is answered from complete receipts; any gap goes
+	// on as before.
+	if lf := logsFillFilterOf(jrq); lf != nil {
+		if resp := logsFillResponse(ctx, n, nrq, lf); resp != nil {
+			return true, resp, nil
+		}
+	}
 	var subRequests []ethGetLogsSubRequest
 	if head, ok := cacheLogsHead(ctx, nrq); ok && fromBlock <= head && head < toBlock {
 		subRequests = []ethGetLogsSubRequest{

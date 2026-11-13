@@ -480,10 +480,19 @@ func (s *fetchScheduler) run(r *fetchRequest) {
 	close(r.done)
 }
 
-// do makes the request's one sweep. A panic in it, in the sweep, its
+// do makes the request's one fetch: through the network's shared block
+// store when one is attached (readThrough), else its one sweep.
+func (s *fetchScheduler) do(r *fetchRequest) fetchResult {
+	if res, ok := s.readThrough(s.ctx, r, func() fetchResult { return s.sweepOnce(r) }); ok {
+		return res
+	}
+	return s.sweepOnce(r)
+}
+
+// sweepOnce makes the request's one sweep. A panic in it, in the sweep, its
 // answer check or decode, fails the fetch: its waiters get the error, run
 // frees its slot and backs its key off.
-func (s *fetchScheduler) do(r *fetchRequest) (res fetchResult) {
+func (s *fetchScheduler) sweepOnce(r *fetchRequest) (res fetchResult) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			telemetry.MetricUnexpectedPanicTotal.WithLabelValues(

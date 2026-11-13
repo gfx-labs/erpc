@@ -22,7 +22,9 @@ import (
 type EvmJsonRpcCache struct {
 	projectId string
 	policies  []*data.CachePolicy
-	logger    *zerolog.Logger
+	// connectors are every declared connector by id, policies' or not.
+	connectors map[string]data.Connector
+	logger     *zerolog.Logger
 
 	// cachingStrategy is the write-side admission default (see
 	// common.AllowsCacheWrite). Combined with resp.Cacheable() at Set.
@@ -78,6 +80,7 @@ func NewEvmJsonRpcCache(ctx context.Context, logger *zerolog.Logger, cfg *common
 	}
 	cache := &EvmJsonRpcCache{
 		policies:        policies,
+		connectors:      connectors,
 		logger:          logger,
 		cachingStrategy: strategy,
 	}
@@ -149,6 +152,7 @@ func (c *EvmJsonRpcCache) WithProjectId(projectId string) *EvmJsonRpcCache {
 	return &EvmJsonRpcCache{
 		logger:               &lg,
 		policies:             c.policies,
+		connectors:           c.connectors,
 		projectId:            projectId,
 		cachingStrategy:      c.cachingStrategy,
 		compressionEnabled:   c.compressionEnabled,
@@ -1506,4 +1510,20 @@ func (c *EvmJsonRpcCache) decompressValueBytes(compressedData []byte) ([]byte, e
 	}
 
 	return decompressed, nil
+}
+
+// Connector is the declared connector with id; nil when none is.
+func (c *EvmJsonRpcCache) Connector(id string) data.Connector {
+	if c == nil {
+		return nil
+	}
+	if conn := c.connectors[id]; conn != nil {
+		return conn
+	}
+	for _, p := range c.policies {
+		if conn := p.GetConnector(); conn != nil && conn.Id() == id {
+			return conn
+		}
+	}
+	return nil
 }
