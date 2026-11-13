@@ -3207,6 +3207,13 @@ type EvmNetworkConfig struct {
 	// provider-defined routing. This does not affect eth_query* or gRPC Query.
 	SafeBlockSource string `yaml:"safeBlockSource,omitempty" json:"safeBlockSource,omitempty"`
 
+	// HeadCache opts into the head-driven full-block/log cache: a Redis-shared,
+	// parent-hash-verified window of recent canonical blocks (with their
+	// logs) hydrated from upstreams as the head advances. It serves
+	// eth_getBlockByNumber/ByHash and eth_getLogs when fully covered. Nil or
+	// disabled changes nothing.
+	HeadCache *EvmHeadCacheConfig `yaml:"headCache,omitempty" json:"headCache,omitempty"`
+
 	// Deprecated: replaced by EmptyResultConfidence (blockHead). Retained as a yaml-only
 	// key so existing configs keep loading; SetDefaults warns and ignores it. The old
 	// numeric distance band is gone — use emptyResultConfidence instead.

@@ -1906,6 +1906,11 @@ func (n *NetworkConfig) Validate(c *Config) error {
 			return err
 		}
 	}
+	if n.Evm != nil && n.Evm.HeadCache != nil && n.Evm.HeadCache.Enabled {
+		if err := n.Evm.HeadCache.ValidateConnector(c); err != nil {
+			return err
+		}
+	}
 	if n.Svm != nil {
 		if err := n.Svm.Validate(); err != nil {
 			return err
@@ -1996,6 +2001,9 @@ func (s *StaticResponseConfig) Validate() error {
 }
 
 func (e *EvmNetworkConfig) Validate() error {
+	if err := e.HeadCache.Validate(); err != nil {
+		return err
+	}
 	if e.FallbackFinalityDepth == 0 {
 		return fmt.Errorf("network.*.evm.fallbackFinalityDepth must be greater than 0")
 	}

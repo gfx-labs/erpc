@@ -340,6 +340,12 @@ export interface ServerConfig {
     responseHeaders?: {
         [key: string]: string;
     };
+    /**
+     * MaxRequestBodySize caps one HTTP request body in bytes, counted after
+     * gzip decompression (0 = unlimited). An over-limit body gets HTTP 413
+     * and none of it runs.
+     */
+    maxRequestBodySize?: number;
     webSocket?: WebSocketServerConfig;
     /**
      * ExecutionHeaders controls the per-request diagnostic headers
@@ -860,6 +866,7 @@ export interface NetworkDefaults {
     multiplexing?: boolean;
     cacheKeySuffix?: string;
     failover?: FailoverConfig;
+    maxClientBatchSize?: number;
 }
 /**
  * FailoverConfig controls per-request escalation to fallback-tier upstreams,
@@ -1756,6 +1763,14 @@ export interface NetworkConfig {
      * network id are escaped; see CachePartitionKey.
      */
     cacheKeySuffix?: string;
+    /**
+     * MaxClientBatchSize caps how many requests one client JSON-RPC batch may
+     * address to this network. Unset inherits networkDefaults; unset there or
+     * 0 means no limit. An over-limit batch runs none of its requests.
+     * Distinct from upstream jsonRpc.batchMaxSize, which shapes the batches
+     * eRPC itself sends to an upstream.
+     */
+    maxClientBatchSize?: number;
 }
 /**
  * StaticResponseConfig declares a canned JSON-RPC response for a specific
@@ -2104,6 +2119,14 @@ export interface EvmNetworkConfig {
      * provider-defined routing. This does not affect eth_query* or gRPC Query.
      */
     safeBlockSource?: string;
+    /**
+     * HeadCache opts into the head-driven full-block/log cache: a Redis-shared,
+     * parent-hash-verified window of recent canonical blocks (with their
+     * logs) hydrated from upstreams as the head advances. It serves
+     * eth_getBlockByNumber/ByHash and eth_getLogs when fully covered. Nil or
+     * disabled changes nothing.
+     */
+    headCache?: EvmHeadCacheConfig;
 }
 /**
  * EvmChainTrackerConfig sizes the window a chain tracker holds.
@@ -2162,15 +2185,17 @@ export interface EvmServedTipConfig {
     guaranteedFor?: string[];
     /**
      * MaxRegressionBlocks is how far below the corroborated LIVE upstream head
-     * (the second-highest live head) the pick may fall before it is treated as
-     * a poisoned ballot rather than as reality. While a pick is below that
-     * bound the network keeps serving its last corroborated pick (in-process,
-     * for at most one minute, then it fails open and serves the pick as
-     * computed). 0 uses DefaultToleratedBlockHeadRollback (1024) — the same
-     * rollback tolerance the state poller and health tracker apply to a
-     * retreating head, so all three layers agree on what counts as a genuine
-     * deep correction. -1 disables the regression guard entirely; no other
-     * negative value is accepted.
+     * (the second-highest live head) the finalized pick may fall before it is
+     * treated as a poisoned ballot rather than as reality. While a pick is
+     * below that bound the network keeps serving its last corroborated pick
+     * (in-process, for at most one minute, then it fails open and serves the
+     * pick as computed). 0 uses DefaultToleratedBlockHeadRollback (1024) - the
+     * same rollback tolerance the state poller and health tracker apply to a
+     * retreating head - widened to twice the lane's typical finality step
+     * (the lower median of its last eight finalized advances), so a chain
+     * that finalizes in larger batches does not hold when one voter lags a
+     * batch. -1 disables the regression guard entirely; no other negative
+     * value is accepted.
      */
     maxRegressionBlocks?: number;
     /**
@@ -2585,6 +2610,81 @@ export declare const RateLimitStoreFailureDeny: RateLimitStoreFailureMode;
  * counts every request, at maxCount × localLimitFactor.
  */
 export declare const RateLimitStoreFailureLocal: RateLimitStoreFailureMode;
+/**
+ * EvmHeadCacheConfig configures the head-driven full-block/log cache.
+ */
+export interface EvmHeadCacheConfig {
+    /**
+     * Enabled turns the cache on. Default false.
+     */
+    enabled?: boolean;
+    /**
+     * ConnectorId names a redis-driver connector declared under
+     * database.evmJsonRpcCache.connectors. Its Redis client holds the shared
+     * canonical window: one lease holder hydrates and publishes epoch-fenced
+     * snapshots, every replica serves them. Required.
+     */
+    connectorId?: string;
+    /**
+     * Depth is how many recent canonical blocks the window holds. Default 128.
+     */
+    depth?: number;
+    /**
+     * MaxBytes bounds the total serialized size (blocks + logs) held. When the
+     * window would exceed it, the oldest blocks are evicted. Default 256MB.
+     */
+    maxBytes?: number;
+    /**
+     * MaxPerTick bounds how many blocks a single follow step hydrates, so a
+     * cold start or a long outage converges steadily. Default 16.
+     */
+    maxPerTick?: number;
+    /**
+     * Concurrency bounds in-flight upstream fetches per network. Default 4.
+     */
+    concurrency?: number;
+    /**
+     * PollInterval is the fallback tick that re-verifies the tip hash even
+     * when the height has not changed (same-height reorgs). Default 2s.
+     */
+    pollInterval?: Duration;
+    /**
+     * FetchTimeout bounds each hydration fetch, additionally capped by the
+     * whole-tick lease deadline. Default 10s.
+     */
+    fetchTimeout?: Duration;
+    /**
+     * MaxLogsRange caps the block span an eth_getLogs range may have to be
+     * served from the cache. Wider ranges go upstream. Default = Depth.
+     */
+    maxLogsRange?: number;
+    /**
+     * MaxBlockBytes rejects (never caches) any single block whose block+logs
+     * payload exceeds it. Default min(16MB, maxBytes).
+     */
+    maxBlockBytes?: number;
+    /**
+     * MaxStaleness disables serving (normal upstream path) when the local
+     * view has not been verified for this long. Followers anchor freshness to
+     * the snapshot's writer timestamp, clamped to local receipt time.
+     * Default 5 * pollInterval.
+     */
+    maxStaleness?: Duration;
+    /**
+     * Namespace isolates shared state between deployments. Defaults to
+     * "default". A fingerprint of the
+     * network's upstream set is always appended, so replicas only share data
+     * when they run the same upstream configuration.
+     */
+    namespace?: string;
+    /**
+     * LeaseTTL is the hydration leadership lease. It is renewed every
+     * tick. Coordination and all batch work share a deadline of 80% of this
+     * TTL so publication cannot outlive the lease. Must be > 2*pollInterval.
+     * Default 3*pollInterval + 1s.
+     */
+    leaseTtl?: Duration;
+}
 /**
  * IntegrityHeaderModeOff ignores per-request integrity headers entirely.
  */

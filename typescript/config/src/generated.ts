@@ -2132,6 +2132,14 @@ export interface EvmNetworkConfig {
    * provider-defined routing. This does not affect eth_query* or gRPC Query.
    */
   safeBlockSource?: string;
+  /**
+   * HeadCache opts into the head-driven full-block/log cache: a Redis-shared,
+   * parent-hash-verified window of recent canonical blocks (with their
+   * logs) hydrated from upstreams as the head advances. It serves
+   * eth_getBlockByNumber/ByHash and eth_getLogs when fully covered. Nil or
+   * disabled changes nothing.
+   */
+  headCache?: EvmHeadCacheConfig;
 }
 /**
  * EvmChainTrackerConfig sizes the window a chain tracker holds.
@@ -2607,6 +2615,85 @@ export const RateLimitStoreFailureDeny: RateLimitStoreFailureMode = "deny";
  * counts every request, at maxCount × localLimitFactor.
  */
 export const RateLimitStoreFailureLocal: RateLimitStoreFailureMode = "local";
+
+//////////
+// source: config_headcache.go
+
+/**
+ * EvmHeadCacheConfig configures the head-driven full-block/log cache.
+ */
+export interface EvmHeadCacheConfig {
+  /**
+   * Enabled turns the cache on. Default false.
+   */
+  enabled?: boolean;
+  /**
+   * ConnectorId names a redis-driver connector declared under
+   * database.evmJsonRpcCache.connectors. Its Redis client holds the shared
+   * canonical window: one lease holder hydrates and publishes epoch-fenced
+   * snapshots, every replica serves them. Required.
+   */
+  connectorId?: string;
+  /**
+   * Depth is how many recent canonical blocks the window holds. Default 128.
+   */
+  depth?: number /* int64 */;
+  /**
+   * MaxBytes bounds the total serialized size (blocks + logs) held. When the
+   * window would exceed it, the oldest blocks are evicted. Default 256MB.
+   */
+  maxBytes?: number /* int64 */;
+  /**
+   * MaxPerTick bounds how many blocks a single follow step hydrates, so a
+   * cold start or a long outage converges steadily. Default 16.
+   */
+  maxPerTick?: number /* int64 */;
+  /**
+   * Concurrency bounds in-flight upstream fetches per network. Default 4.
+   */
+  concurrency?: number /* int */;
+  /**
+   * PollInterval is the fallback tick that re-verifies the tip hash even
+   * when the height has not changed (same-height reorgs). Default 2s.
+   */
+  pollInterval?: Duration;
+  /**
+   * FetchTimeout bounds each hydration fetch, additionally capped by the
+   * whole-tick lease deadline. Default 10s.
+   */
+  fetchTimeout?: Duration;
+  /**
+   * MaxLogsRange caps the block span an eth_getLogs range may have to be
+   * served from the cache. Wider ranges go upstream. Default = Depth.
+   */
+  maxLogsRange?: number /* int64 */;
+  /**
+   * MaxBlockBytes rejects (never caches) any single block whose block+logs
+   * payload exceeds it. Default min(16MB, maxBytes).
+   */
+  maxBlockBytes?: number /* int64 */;
+  /**
+   * MaxStaleness disables serving (normal upstream path) when the local
+   * view has not been verified for this long. Followers anchor freshness to
+   * the snapshot's writer timestamp, clamped to local receipt time.
+   * Default 5 * pollInterval.
+   */
+  maxStaleness?: Duration;
+  /**
+   * Namespace isolates shared state between deployments. Defaults to
+   * "default". A fingerprint of the
+   * network's upstream set is always appended, so replicas only share data
+   * when they run the same upstream configuration.
+   */
+  namespace?: string;
+  /**
+   * LeaseTTL is the hydration leadership lease. It is renewed every
+   * tick. Coordination and all batch work share a deadline of 80% of this
+   * TTL so publication cannot outlive the lease. Must be > 2*pollInterval.
+   * Default 3*pollInterval + 1s.
+   */
+  leaseTtl?: Duration;
+}
 
 //////////
 // source: config_integrity.go

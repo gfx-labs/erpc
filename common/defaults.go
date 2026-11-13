@@ -2724,6 +2724,7 @@ func (c *EvmChainTrackerConfig) SetDefaults() {
 }
 
 func (e *EvmNetworkConfig) SetDefaults() error {
+	e.HeadCache.SetDefaults()
 	if e.FallbackFinalityDepth == 0 {
 		e.FallbackFinalityDepth = DefaultEvmFinalityDepth
 	}

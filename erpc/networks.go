@@ -23,6 +23,7 @@ import (
 	"github.com/erpc/erpc/architecture/svm"
 	"github.com/erpc/erpc/common"
 	"github.com/erpc/erpc/data"
+	"github.com/erpc/erpc/headcache"
 	"github.com/erpc/erpc/health"
 	"github.com/erpc/erpc/indexer"
 	"github.com/erpc/erpc/indexer/mempool"
@@ -70,6 +71,9 @@ type Network struct {
 	policyEngine        *policy.Engine
 	initializer         *util.Initializer
 	architectureHandler common.ArchitectureHandler
+
+	// headCache is the opt-in head-driven block/log cache (nil when disabled).
+	headCache *headcache.Cache
 
 	// forkDemoted are the voters on a minority fork (EvmForkDemoted): no
 	// number vote, last in routing. nil while none is.
@@ -2712,6 +2716,15 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 		}
 	}
 
+	// Head cache: fully covered block/log reads answered from the verified
+	// canonical window. Misses fall through to the normal path unchanged.
+	if n.headCache != nil {
+		if resp, ok := n.tryServeHeadCache(ctx, req, method); ok {
+			forwardSpan.SetAttributes(attribute.Bool("head_cache.hit", true))
+			return resp, nil
+		}
+	}
+
 	// Route safe-tagged requests before multiplexing and cache lookup; the
 	// project already did for its requests, this covers direct callers.
 	if n.cfg.Architecture == common.ArchitectureEvm {
@@ -3710,7 +3723,7 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 		// Skip Set so defaultAllow cannot admit those into the selector-shared
 		// store. Cache.Set still applies strategy × mark for stamped responses.
 		skipUnmarkedSelectorSet := selectorOn && resp.Cacheable() == nil
-		if n.cacheDal != nil && !uncached && !skipUnmarkedSelectorSet && !(tagReads && servesAnotherBlock(ctx, req, resp)) {
+		if n.cacheDal != nil && !uncached && !cacheWriteBypassed(ctx) && !skipUnmarkedSelectorSet && !(tagReads && servesAnotherBlock(ctx, req, resp)) {
 			n.storeInCache(ctx, forwardSpan.SpanContext(), &lg, method, req, resp)
 		} else if skipUnmarkedSelectorSet {
 			lg.Debug().Msg("skipping cache write: unmarked response on selector-enabled network")

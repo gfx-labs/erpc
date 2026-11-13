@@ -20,9 +20,10 @@ import (
 )
 
 type EvmJsonRpcCache struct {
-	projectId string
-	policies  []*data.CachePolicy
-	logger    *zerolog.Logger
+	projectId  string
+	policies   []*data.CachePolicy
+	connectors map[string]data.Connector
+	logger     *zerolog.Logger
 
 	// cachingStrategy is the write-side admission default (see
 	// common.AllowsCacheWrite). Combined with resp.Cacheable() at Set.
@@ -78,6 +79,7 @@ func NewEvmJsonRpcCache(ctx context.Context, logger *zerolog.Logger, cfg *common
 	}
 	cache := &EvmJsonRpcCache{
 		policies:        policies,
+		connectors:      connectors,
 		logger:          logger,
 		cachingStrategy: strategy,
 	}
@@ -149,6 +151,7 @@ func (c *EvmJsonRpcCache) WithProjectId(projectId string) *EvmJsonRpcCache {
 	return &EvmJsonRpcCache{
 		logger:               &lg,
 		policies:             c.policies,
+		connectors:           c.connectors,
 		projectId:            projectId,
 		cachingStrategy:      c.cachingStrategy,
 		compressionEnabled:   c.compressionEnabled,
@@ -157,6 +160,15 @@ func (c *EvmJsonRpcCache) WithProjectId(projectId string) *EvmJsonRpcCache {
 		encoderPool:          c.encoderPool,
 		decoderPool:          c.decoderPool,
 	}
+}
+
+// Connector returns the configured cache connector with the given id, or nil.
+// Other features (the head cache) reuse its client instead of opening their own.
+func (c *EvmJsonRpcCache) Connector(id string) data.Connector {
+	if c == nil {
+		return nil
+	}
+	return c.connectors[id]
 }
 
 func (c *EvmJsonRpcCache) SetPolicies(policies []*data.CachePolicy) {
