@@ -301,15 +301,62 @@ func (d *Decoded) Transactions() []Tx {
 			if !ok {
 				continue // hash-only entry; nothing to validate at tx level
 			}
-			b, err := common.SonicCfg.Marshal(obj)
-			if err != nil {
-				continue
-			}
-			var t Tx
-			if err := common.SonicCfg.Unmarshal(b, &t); err == nil {
+			if t, ok := txFromObject(obj); ok {
 				d.txs = append(d.txs, t)
 			}
 		}
 	}
 	return d.txs
+}
+
+// txViewKeys are the Tx view's JSON keys, matched exactly by txFromObject.
+var txViewKeys = [...]string{"hash", "from", "to", "gas", "blockHash", "blockNumber", "transactionIndex"}
+
+// txFromObject builds the Tx view of an already-decoded transaction object.
+// It reads the view's keys straight from the map; any object whose keys or
+// values a direct read cannot settle exactly (a key equal to a view key only
+// under case folding, which the JSON decoders match too, or a view key with a
+// value that is neither a string nor null) takes txFromObjectRoundTrip, the
+// original re-encode and decode, so the view and its accept/reject stay
+// exactly what they were.
+func txFromObject(obj map[string]any) (Tx, bool) {
+	var v [len(txViewKeys)]string
+	for i, k := range txViewKeys {
+		switch x := obj[k].(type) {
+		case string:
+			v[i] = x
+		case nil:
+		default:
+			return txFromObjectRoundTrip(obj)
+		}
+	}
+	for k := range obj {
+		if foldsToTxViewKey(k) {
+			return txFromObjectRoundTrip(obj)
+		}
+	}
+	return Tx{Hash: v[0], From: v[1], To: v[2], Gas: v[3], BlockHash: v[4], BlockNumber: v[5], TransactionIndex: v[6]}, true
+}
+
+// foldsToTxViewKey reports whether k is not a view key yet equals one under
+// case folding (Unicode folding included, as the decoders apply it).
+func foldsToTxViewKey(k string) bool {
+	for _, vk := range txViewKeys {
+		if k != vk && strings.EqualFold(k, vk) {
+			return true
+		}
+	}
+	return false
+}
+
+func txFromObjectRoundTrip(obj map[string]any) (Tx, bool) {
+	b, err := common.SonicCfg.Marshal(obj)
+	if err != nil {
+		return Tx{}, false
+	}
+	var t Tx
+	if err := common.SonicCfg.Unmarshal(b, &t); err != nil {
+		return Tx{}, false
+	}
+	return t, true
 }
