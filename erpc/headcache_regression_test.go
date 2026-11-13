@@ -67,11 +67,24 @@ func TestHttp_HeadCache_MalformedFiltersBypassAndTopicPositionsMatchGeth(t *test
 	require.JSONEq(t, "[]", string(result.Result))
 	require.Equal(t, before, up.RangeLogCalls())
 
+	// Malformed addresses and topics are refused at the request boundary
+	// with invalid params, so neither the head cache nor an upstream sees them.
 	for _, filter := range []string{
 		`{"fromBlock":"0x13","toBlock":"0x13","address":"0x1234"}`,
 		`{"fromBlock":"0x13","toBlock":"0x13","address":["not-an-address"]}`,
 		`{"fromBlock":"0x13","toBlock":"0x13","topics":["0x12"]}`,
 		`{"fromBlock":"0x13","toBlock":"0x13","topics":[["not-hex"]]}`,
+	} {
+		t.Run(filter, func(t *testing.T) {
+			before := up.LogFilterCalls(filter)
+			code, _, body := send(`{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[`+filter+`]}`, nil, nil)
+			require.Equal(t, 400, code, body)
+			require.Contains(t, body, "-32602", body)
+			require.Equal(t, before, up.LogFilterCalls(filter), "refused filter must not reach the upstream")
+		})
+	}
+
+	for _, filter := range []string{
 		fmt.Sprintf(`{"blockHash":%q,"toBlock":"0x13"}`, up.HashAt(19)),
 		`{"blockHash":null,"fromBlock":"0x13","toBlock":"0x13"}`,
 		`{"blockHash":"0x12"}`,

@@ -47,7 +47,7 @@ func headCacheTestRedis() string {
 // database.evmJsonRpcCache (the only supported store).
 func headCacheTestConfig(upstreamURL string, hc *common.EvmHeadCacheConfig) *common.Config {
 	cfg := &common.Config{
-		Server: &common.ServerConfig{ListenV4: util.BoolPtr(true), WebSocket: &common.WebSocketServerConfig{Enabled: true}},
+		Server: &common.ServerConfig{ListenV4: util.BoolPtr(true), WebSocket: &common.WebSocketServerConfig{Enabled: util.BoolPtr(true)}},
 		Projects: []*common.ProjectConfig{{
 			Id: "test_project",
 			Networks: []*common.NetworkConfig{{

@@ -205,7 +205,7 @@ func (f *networkHeadFetcher) call(ctx context.Context, method string, params []i
 		return nil, fmt.Errorf("set head cache request id: %w", err)
 	}
 	rq := common.NewNormalizedRequestFromJsonRpcRequest(jrq)
-	rq.SetDirectives(&common.RequestDirectives{IsInternal: true, SkipCacheRead: "true", RetryEmpty: true})
+	rq.SetDirectives(&common.RequestDirectives{UpstreamPolicies: common.UpstreamPoliciesTimeoutOnly, SkipCacheRead: "true", RetryEmpty: true})
 	resp, err := f.n.Forward(withCacheWriteBypass(withHeadCacheBypass(ctx)), rq)
 	if err != nil {
 		return nil, err
@@ -245,7 +245,7 @@ func (n *Network) tryServeHeadCache(ctx context.Context, req *common.NormalizedR
 	}
 	// Directed requests (specific upstreams, integrity profiles, cache
 	// bypass) are outside the default trust set the cache was built from.
-	if d := req.Directives(); d != nil && (d.IsInternal || d.UseUpstream != "" || d.IntegritySelector != "" || d.SkipCacheRead != "") {
+	if d := req.Directives(); d != nil && (d.UpstreamPolicies != common.UpstreamPoliciesConfigured || d.UseUpstream != "" || d.IntegritySelector != "" || d.SkipCacheRead != "") {
 		return nil, false
 	}
 	switch method {

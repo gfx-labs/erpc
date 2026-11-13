@@ -3,830 +3,740 @@ package erpc
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime/debug"
-	"strings"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/coder/websocket"
 	"github.com/erpc/erpc/auth"
 	"github.com/erpc/erpc/common"
-	"github.com/erpc/erpc/headcache"
+	"github.com/erpc/erpc/indexer/adapters/wsclient"
 	"github.com/erpc/erpc/telemetry"
+	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog"
 )
 
-// WebSocket subscription endpoint.
-//
-// Served on the same paths as HTTP (/<project>/<architecture>/<chainId>, or
-// aliased) when the client sends an Upgrade request and server.webSocket is
-// enabled. The upgrade is rejected (HTTP 503) unless the network has a
-// Redis-backed head cache: notifications are rendered only from cached
-// canonical block/log events and never trigger upstream calls.
-//
-// Contract (subscriptions only):
-//   - eth_subscribe("newHeads") and eth_subscribe("logs", {address, topics}).
-//     Reorgs emit orphaned logs with "removed":true (highest block first)
-//     followed by the new canonical logs. The subscription id reply always
-//     precedes its notifications.
-//   - eth_unsubscribe only sees ids created on the same connection.
-//   - Any other method gets -32601 and batch frames get -32600; ordinary
-//     JSON-RPC calls belong on HTTP.
-//
-// Frames are handled sequentially per connection. Bounds:
-// server.webSocket.maxConnections / maxConnectionsPerProject (HTTP 503 at
-// upgrade), maxSubscriptionsPerConnection, maxMessageBytes (1009 close),
-// sendQueueSize (a client that falls this far behind, or whose head cache
-// subscription overflows or skips heights, is closed with 1008),
-// writeTimeout per frame. Credentials are re-checked every pingInterval.
-// Connections close with 1001 when the server shuts down.
+var wsConnCounter int64
 
-const (
-	wsCloseSlowConsumer = "slow consumer"
-	// Fallback for configs that bypassed SetDefaults. Ping never becomes
-	// disabled: re-auth rides on it.
-	wsDefaultPingInterval = 30 * time.Second
-)
-
-func (ws *wsServer) pingInterval() time.Duration {
-	if d := ws.cfg.PingInterval.Duration(); d > 0 {
-		return d
-	}
-	return wsDefaultPingInterval
-}
-
-type wsServer struct {
-	s     *HttpServer
-	cfg   *common.WebSocketServerConfig
-	conns atomic.Int64
-
-	mu         sync.Mutex
-	perProject map[string]int
-}
-
-func newWsServer(s *HttpServer, cfg *common.WebSocketServerConfig) *wsServer {
-	if cfg == nil || !cfg.Enabled {
-		return nil
-	}
-	return &wsServer{s: s, cfg: cfg, perProject: map[string]int{}}
-}
-
-func isWebSocketUpgrade(r *http.Request) bool {
-	return r.Method == http.MethodGet &&
-		strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
-		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
-}
-
-// wrap routes upgrade requests to the WS server before the timeout/gzip
-// wrappers (which cannot hijack). All other requests are untouched.
-func (ws *wsServer) wrap(next http.Handler) http.Handler {
-	if ws == nil {
-		return next
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isWebSocketUpgrade(r) {
-			ws.serve(w, r)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func wsHttpError(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	b, _ := json.Marshal(msg)
-	_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","error":{"code":-32600,"message":%s}}`, b)
-}
-
-func (ws *wsServer) serve(w http.ResponseWriter, r *http.Request) {
-	s := ws.s
-	defer func() {
-		if rec := recover(); rec != nil {
-			telemetry.MetricUnexpectedPanicTotal.WithLabelValues("ws-handler", "", common.ErrorFingerprint(rec)).Inc()
-			s.logger.Error().Interface("panic", rec).Str("stack", string(debug.Stack())).Msg("unexpected panic in websocket handler")
-		}
-	}()
-	if s.draining != nil && s.draining.Load() {
-		wsHttpError(w, http.StatusServiceUnavailable, "server is shutting down")
-		return
-	}
-
-	projectId, architecture, chainId := ws.resolveAlias(r)
-	projectId, architecture, chainId, isAdmin, isHealth, err := s.parseUrlPath(r, projectId, architecture, chainId)
-	// parseUrlPath classifies every non-POST project path as a healthcheck;
-	// only an explicit /healthcheck suffix is one for upgrades.
-	if isHealth && !strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/healthcheck") {
-		isHealth = false
-	}
-	if err != nil || isAdmin || isHealth || projectId == "" || architecture == "" || chainId == "" {
-		wsHttpError(w, http.StatusBadRequest, "websocket requires /<project>/<architecture>/<chainId>")
-		return
-	}
-	project, err := s.erpc.GetProject(projectId)
-	if err != nil || project == nil {
-		wsHttpError(w, http.StatusNotFound, "project not found")
-		return
-	}
-	networkId := architecture + ":" + chainId
-
-	// Origin, credentials and connection caps are all checked before the
-	// network is resolved: GetNetwork may lazily create and hydrate a network
-	// (upstream calls), which unauthenticated clients must never trigger.
-
-	// Browsers do not apply CORS to WebSockets, so the project's allowed
-	// origins are enforced here. Without a CORS config any origin is accepted,
-	// matching HTTP behavior (eRPC does not rely on cookies).
-	if origin := r.Header.Get("Origin"); origin != "" && project.Config.CORS != nil {
-		allowed := false
-		for _, o := range project.Config.CORS.AllowedOrigins {
-			if ok, _ := common.WildcardMatch(o, origin); ok {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			wsHttpError(w, http.StatusForbidden, "origin not allowed")
-			return
-		}
-	}
-
-	// Credentials are checked at upgrade so unauthenticated clients never get
-	// a connection. Each message is authenticated again with its own method.
-	if _, err := ws.authenticate(r.Context(), project, r, "eth_subscribe", nil); err != nil {
-		wsHttpError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-
-	if n := ws.conns.Add(1); n > int64(ws.cfg.MaxConnections) {
-		ws.conns.Add(-1)
-		wsHttpError(w, http.StatusServiceUnavailable, "too many websocket connections")
-		return
-	}
-	defer ws.conns.Add(-1)
-	if !ws.acquireProject(projectId) {
-		wsHttpError(w, http.StatusServiceUnavailable, "too many websocket connections for this project")
-		return
-	}
-	defer ws.releaseProject(projectId)
-
-	nw, err := project.GetNetwork(r.Context(), networkId)
-	if err != nil {
-		wsHttpError(w, http.StatusNotFound, "network not found")
-		return
-	}
-	if nw.HeadCache() == nil {
-		wsHttpError(w, http.StatusServiceUnavailable, "websocket subscriptions require evm.headCache for this network")
-		return
-	}
-
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// Origin already enforced above against project CORS.
-		InsecureSkipVerify: true,
-	})
-	if err != nil {
-		return
-	}
-	conn.SetReadLimit(ws.cfg.MaxMessageBytes)
-
-	lg := s.logger.With().Str("component", "ws").Str("projectId", projectId).Str("networkId", networkId).Logger()
-	c := &wsConn{
-		ws:        ws,
-		conn:      conn,
-		project:   project,
-		network:   nw,
-		networkId: networkId,
-		req:       r,
-		clientIP:  s.resolveRealClientIP(r),
-		lg:        &lg,
-		out:       make(chan []byte, ws.cfg.SendQueueSize),
-		subs:      map[string]*wsSub{},
-		mProject:  projectId,
-		mNetwork:  nw.Label(),
-	}
-	telemetry.MetricWsConnections.WithLabelValues(c.mProject, c.mNetwork).Inc()
-	defer telemetry.MetricWsConnections.WithLabelValues(c.mProject, c.mNetwork).Dec()
-	c.run()
-}
-
-func (ws *wsServer) acquireProject(id string) bool {
-	if ws.cfg.MaxConnectionsPerProject <= 0 {
-		return true
-	}
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	if ws.perProject[id] >= ws.cfg.MaxConnectionsPerProject {
-		return false
-	}
-	ws.perProject[id]++
-	return true
-}
-
-func (ws *wsServer) releaseProject(id string) {
-	if ws.cfg.MaxConnectionsPerProject <= 0 {
-		return
-	}
-	ws.mu.Lock()
-	defer ws.mu.Unlock()
-	if ws.perProject[id]--; ws.perProject[id] <= 0 {
-		delete(ws.perProject, id)
-	}
-}
-
-func (ws *wsServer) resolveAlias(r *http.Request) (string, string, string) {
-	cfg := ws.s.serverCfg
-	if cfg == nil || cfg.Aliasing == nil {
-		return "", "", ""
-	}
-	host := r.Host
-	if i := strings.Index(host, ":"); i != -1 {
-		host = host[:i]
-	}
-	for _, rule := range cfg.Aliasing.Rules {
-		if ok, err := common.WildcardMatch(rule.MatchDomain, host); err == nil && ok {
-			return rule.ServeProject, rule.ServeArchitecture, rule.ServeChain
-		}
-	}
-	return "", "", ""
-}
-
-func (ws *wsServer) authenticate(ctx context.Context, project *PreparedProject, r *http.Request, method string, nq *common.NormalizedRequest) (*common.User, error) {
-	ap, err := auth.NewPayloadFromHttp(method, r.RemoteAddr, r.Header, r.URL.Query())
-	if err != nil {
-		return nil, err
-	}
-	if nq == nil {
-		nq = common.NewNormalizedRequest([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":0,"method":%q,"params":[]}`, method)))
-		nq.SetClientIP(ws.s.resolveRealClientIP(r))
-	}
-	return project.AuthenticateConsumer(ctx, nq, method, ap)
-}
-
-type wsSub struct {
+// WsConnection is a client WebSocket connection, bound to one network.
+type WsConnection struct {
 	id     string
-	sub    *headcache.Subscription
-	logs   bool
-	kind   string
-	filter *headcache.LogFilter
-	// unsubscribed distinguishes client eth_unsubscribe from overflow closes.
-	unsubscribed atomic.Bool
-	// last is the highest block number emitted (0 = nothing yet); used to
-	// detect discontinuities so clients never see a silent gap.
-	last int64
-}
+	conn   *websocket.Conn
+	ctx    context.Context // cancelled on teardown; parent of every request
+	cancel context.CancelFunc
+	logger *zerolog.Logger
 
-type wsConn struct {
-	ws        *wsServer
-	conn      *websocket.Conn
+	server    *HttpServer
 	project   *PreparedProject
-	network   *Network
 	networkId string
-	req       *http.Request
-	clientIP  string
-	lg        *zerolog.Logger
-	// metric labels (empty in unit tests that build a bare wsConn)
-	mProject, mNetwork string
+	// networkLabel labels the connection's subscription metrics; set by
+	// SubscriptionManager.getOrCreateConn before the first subscription.
+	networkLabel string
+	// architecture is the URL's, for error bodies built before the request
+	// is bound to its network (as on the HTTP path).
+	architecture common.NetworkArchitecture
+	httpReq      *http.Request // the upgrade request, for auth and headers
+	// costFrames: every text message starts with a cost header block (see
+	// encodeMessage); set at upgrade from headerCostFrames and costHeaders.
+	costFrames bool
+	// notifyCostBlocks caches each subscription kind's notification block.
+	notifyCostBlocks [wsclient.KindPendingTx + 1]atomic.Pointer[[]byte]
 
-	ctx    context.Context
-	cancel context.CancelCauseFunc
-	out    chan []byte
+	// w is the connection's one data writer (see ws_writer.go).
+	w wsWriter
 
-	mu   sync.Mutex
-	subs map[string]*wsSub
-	wg   sync.WaitGroup
+	// sem bounds concurrent requests; inflight lets teardown wait for them.
+	sem      chan struct{}
+	inflight sync.WaitGroup
+
+	// stop records how the connection should end and stops the read loop;
+	// teardown (run by the read loop's goroutine) carries it out.
+	stopOnce    sync.Once
+	stopped     chan struct{}
+	closeCode   int
+	closeReason string
+	closeGrace  time.Duration
+	done        chan struct{}
+
+	closed     atomic.Bool // nothing more queues once set; the writer drains what did
+	peerClosed atomic.Bool // the peer's close frame was already answered
+
+	// subsClosed is guarded by SubscriptionManager.connMu.
+	subsClosed bool
 }
 
-type wsCloseErr struct {
-	code   websocket.StatusCode
-	reason string
-}
+// handleWebSocket upgrades an HTTP connection to WebSocket and runs the
+// read/write loops for the lifetime of the connection.
+func (s *HttpServer) handleWebSocket(
+	w http.ResponseWriter,
+	r *http.Request,
+	lg *zerolog.Logger,
+	project *PreparedProject,
+	architecture string,
+	chainId string,
+) {
+	wsCfg := s.serverCfg.WebSocket
 
-func (e *wsCloseErr) Error() string { return e.reason }
-
-func (c *wsConn) closeWith(code websocket.StatusCode, reason string) {
-	c.cancel(&wsCloseErr{code: code, reason: reason})
-}
-
-func (c *wsConn) run() {
-	// Tied to the application context, not the request: hijacked
-	// connections are not tracked by http.Server.Shutdown.
-	c.ctx, c.cancel = context.WithCancelCause(c.ws.s.appCtx)
-	defer c.cleanup()
-
-	writerDone := make(chan struct{})
-	go c.writeLoop(writerDone)
-	go c.pingLoop()
-
-	for {
-		// Not c.ctx: coder/websocket tears the connection down without a
-		// close frame when a Read context is cancelled, which would hide
-		// the 1008/1001 status from the client. writeLoop's Close/CloseNow
-		// unblocks this Read instead.
-		_, data, err := c.conn.Read(context.Background())
-		if err != nil {
-			if websocket.CloseStatus(err) == websocket.StatusMessageTooBig {
-				c.closeWith(websocket.StatusMessageTooBig, "message too big")
-			} else {
-				c.cancel(err)
-			}
-			break
-		}
-		c.safeHandle(data)
+	// Refused before the upgrade once shutdown has begun, so the client's dial
+	// fails instead of completing the handshake and being closed right away.
+	if s.draining.Load() {
+		lg.Debug().Msg("websocket connection refused: server shutting down")
+		telemetry.CounterHandle(telemetry.MetricWebsocketRejectedTotal, project.Config.Id, wsRejectShuttingDown).Inc()
+		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		return
 	}
-	<-writerDone
+
+	// Checked before the upgrade so a refused client gets a plain 429.
+	clientIP := s.resolveRealClientIP(r)
+	if reason, ok := s.wsConnLimiter.acquire(clientIP); !ok {
+		lg.Warn().Str("reason", reason).Msg("websocket connection refused: connection limit reached")
+		telemetry.CounterHandle(telemetry.MetricWebsocketRejectedTotal, project.Config.Id, reason).Inc()
+		http.Error(w, "too many websocket connections", http.StatusTooManyRequests)
+		return
+	}
+	defer s.wsConnLimiter.release(clientIP)
+
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  wsCfg.ReadBufferSize,
+		WriteBufferSize: wsCfg.WriteBufferSize,
+		CheckOrigin: func(r *http.Request) bool {
+			return checkWsOrigin(r, project)
+		},
+	}
+
+	wsConn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		lg.Error().Err(err).Msg("websocket upgrade failed")
+		return
+	}
+
+	// Not derived from the app context: shutdown ends connections via stop()
+	// so in-flight requests still get their response.
+	connCtx, connCancel := context.WithCancel(context.Background())
+	wsc := &WsConnection{
+		id:           fmt.Sprintf("ws-%d", atomic.AddInt64(&wsConnCounter, 1)),
+		conn:         wsConn,
+		ctx:          connCtx,
+		cancel:       connCancel,
+		logger:       lg,
+		server:       s,
+		project:      project,
+		networkId:    fmt.Sprintf("%s:%s", architecture, chainId),
+		architecture: common.NetworkArchitecture(architecture),
+		httpReq:      r,
+		costFrames:   s.costHeadersEnabled() && r.Header.Get(headerCostFrames) == "1",
+		sem:          make(chan struct{}, wsCfg.MaxConcurrentRequestsPerConnection),
+		stopped:      make(chan struct{}),
+		done:         make(chan struct{}),
+	}
+
+	lg.Info().Str("connId", wsc.id).Str("remoteAddr", r.RemoteAddr).Msg("websocket connection established")
+
+	// Store before checking draining so shutdownWebSockets either sees this
+	// connection or we see its flag (shutdown began during the handshake).
+	s.activeWsConns.Store(wsc.id, wsc)
+	telemetry.GaugeHandle(telemetry.MetricWebsocketConnectionsActive, project.Config.Id).Inc()
+	if s.draining.Load() {
+		wsc.stop(websocket.CloseGoingAway, "server shutting down", 0)
+	}
+
+	wsConn.SetReadLimit(wsCfg.MaxMessageSize)
+
+	// A peer that sends neither a pong nor a request within pongWait is
+	// dropped; the read loop arms the deadline before every read.
+	pingInterval := wsCfg.PingInterval.Duration()
+	pongWait := 2 * pingInterval
+	wsConn.SetPongHandler(func(string) error {
+		lg.Trace().Str("connId", wsc.id).Msg("websocket pong received")
+		return wsConn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
+	// As gorilla's default handler (echo the close frame), plus logging the
+	// peer's close code and recording that it was answered.
+	wsConn.SetCloseHandler(func(code int, text string) error {
+		lg.Info().
+			Str("connId", wsc.id).
+			Int("closeCode", code).
+			Str("closeReason", text).
+			Msg("websocket close frame received from peer")
+		message := websocket.FormatCloseMessage(code, "")
+		_ = wsConn.WriteControl(websocket.CloseMessage, message, time.Now().Add(wsWriteDeadline))
+		wsc.peerClosed.Store(true)
+		return nil
+	})
+
+	wsc.startWriter()
+	go wsc.pingLoop(pingInterval)
+
+	wsc.readLoop(pongWait)
+	wsc.teardown()
 }
 
-func (c *wsConn) safeHandle(data []byte) {
+// isWebSocketUpgradeRequest reports whether r is a WebSocket opening
+// handshake (RFC 6455 section 4.1) that this server serves. Every
+// upgrade-specific code path uses this one check, so with WebSocket off, or
+// for a request that merely resembles an upgrade, it is ordinary HTTP
+// everywhere.
+func isWebSocketUpgradeRequest(r *http.Request, wsEnabled bool) bool {
+	return wsEnabled && r.Method == http.MethodGet && websocket.IsWebSocketUpgrade(r)
+}
+
+func (s *HttpServer) webSocketEnabled() bool {
+	return s.serverCfg != nil && s.serverCfg.WebSocket != nil &&
+		s.serverCfg.WebSocket.Enabled != nil && *s.serverCfg.WebSocket.Enabled
+}
+
+// checkWsOrigin checks the upgrade request's origin against the project's
+// CORS allowed origins; without a CORS config every origin is allowed.
+func checkWsOrigin(r *http.Request, project *PreparedProject) bool {
+	if project == nil || project.Config.CORS == nil {
+		return true
+	}
+
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+
+	for _, allowedOrigin := range project.Config.CORS.AllowedOrigins {
+		match, err := common.WildcardMatch(allowedOrigin, origin)
+		if err != nil {
+			continue
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func (wsc *WsConnection) readLoop(pongWait time.Duration) {
+	for {
+		// Backpressure: don't read the next request until a slot is free.
+		select {
+		case wsc.sem <- struct{}{}:
+		case <-wsc.stopped:
+			return
+		}
+
+		_ = wsc.conn.SetReadDeadline(time.Now().Add(pongWait))
+		select {
+		case <-wsc.stopped:
+			// stop() may have set its deadline before ours.
+			<-wsc.sem
+			return
+		default:
+		}
+
+		_, message, err := wsc.conn.ReadMessage()
+		if err != nil {
+			<-wsc.sem
+			select {
+			case <-wsc.stopped:
+				return
+			default:
+			}
+			// The error type tells a clean close, a dropped connection and
+			// an expired read deadline apart.
+			ev := wsc.logger.Info().Str("connId", wsc.id).Err(err).
+				Str("errType", fmt.Sprintf("%T", err))
+			if ce, ok := err.(*websocket.CloseError); ok {
+				ev = ev.Int("closeCode", ce.Code).Str("closeReason", ce.Text)
+			}
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				ev.Msg("websocket read ended: unexpected close")
+			} else {
+				ev.Msg("websocket read ended")
+			}
+			return
+		}
+
+		wsc.inflight.Add(1)
+		go func() {
+			defer func() {
+				<-wsc.sem
+				wsc.inflight.Done()
+			}()
+			wsc.handleMessage(message)
+		}()
+	}
+}
+
+func (wsc *WsConnection) handleMessage(raw []byte) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			telemetry.MetricUnexpectedPanicTotal.WithLabelValues("ws-message", c.networkId, common.ErrorFingerprint(rec)).Inc()
-			c.lg.Error().Interface("panic", rec).Str("stack", string(debug.Stack())).Msg("unexpected panic handling websocket message")
-			c.closeWith(websocket.StatusInternalError, "internal error")
+			telemetry.MetricUnexpectedPanicTotal.WithLabelValues(
+				"ws-request-handler",
+				fmt.Sprintf("project:%s network:%s", wsc.project.Config.Id, wsc.networkId),
+				common.ErrorFingerprint(rec),
+			).Inc()
+			wsc.logger.Error().
+				Interface("panic", rec).
+				Str("stack", string(debug.Stack())).
+				Str("connId", wsc.id).
+				Msg("unexpected panic in websocket message handler")
 		}
 	}()
-	c.handleMessage(data)
-}
 
-func (c *wsConn) cleanup() {
-	c.cancel(nil)
-	c.mu.Lock()
-	for id, s := range c.subs {
-		telemetry.MetricWsSubscriptions.WithLabelValues(c.mProject, c.mNetwork, s.kind).Dec()
-		s.unsubscribed.Store(true)
-		s.sub.Close()
-		delete(c.subs, id)
+	startedAt := time.Now()
+	ctx, cancel := context.WithTimeoutCause(wsc.ctx, wsc.server.reqMaxTimeout, ErrHandlerTimeout)
+	defer cancel()
+
+	raw = bytes.TrimLeft(raw, " \t\r\n")
+	if len(raw) > 0 && raw[0] == '[' {
+		wsc.handleBatch(ctx, raw, &startedAt)
+		return
 	}
-	c.mu.Unlock()
-	c.wg.Wait()
-}
 
-func (c *wsConn) writeLoop(done chan struct{}) {
-	defer close(done)
-	wt := c.ws.cfg.WriteTimeout.Duration()
-	for {
-		select {
-		case <-c.ctx.Done():
-			code, reason := websocket.StatusNormalClosure, ""
-			var ce *wsCloseErr
-			cause := context.Cause(c.ctx)
-			switch {
-			case errors.As(cause, &ce):
-				code, reason = ce.code, ce.reason
-				if c.ws.s.appCtx.Err() != nil {
-					c.recordClose("shutdown")
-				} else if strings.Contains(reason, wsCloseSlowConsumer) || reason == "write timeout" {
-					c.recordClose("slow_consumer")
-				} else {
-					c.recordClose("error")
-				}
-			case websocket.CloseStatus(cause) != -1:
-				// Peer closed; the library echoes the close frame.
-				c.recordClose("client")
-				_ = c.conn.CloseNow()
-				return
-			case c.ws.s.appCtx.Err() != nil:
-				code, reason = websocket.StatusGoingAway, "server shutting down"
-				c.recordClose("shutdown")
-			default:
-				// Read failed without a close frame (dropped TCP etc).
-				c.recordClose("client")
-			}
-			go func() {
-				time.Sleep(wt)
-				_ = c.conn.CloseNow()
-			}()
-			_ = c.conn.Close(code, reason)
-			return
-		case msg := <-c.out:
-			wctx, cancel := context.WithTimeout(c.ctx, wt)
-			err := c.conn.Write(wctx, websocket.MessageText, msg)
-			cancel()
-			if err != nil {
-				c.closeWith(websocket.StatusPolicyViolation, "write timeout")
-			}
+	out, notification, open := wsc.handleRequest(ctx, raw, &startedAt, false)
+	if notification {
+		wsc.writeMeteringOnly(wsc.costBlock(ctx, []interface{}{out}))
+		if r, ok := out.(*common.NormalizedResponse); ok {
+			go r.Release()
 		}
-	}
-}
-
-// pingLoop detects dead peers (which would otherwise hold a connection slot
-// until TCP gives up) and keeps idle connections alive behind LB idle
-// timeouts. Pong handling requires the concurrent reader in run().
-func (c *wsConn) pingLoop() {
-	t := time.NewTicker(c.ws.pingInterval())
-	defer t.Stop()
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-t.C:
-			pctx, cancel := context.WithTimeout(c.ctx, c.ws.cfg.WriteTimeout.Duration())
-			err := c.conn.Ping(pctx)
-			cancel()
-			if err != nil && c.ctx.Err() == nil {
-				c.closeWith(websocket.StatusPolicyViolation, "ping timeout")
-				return
-			}
-			// Re-check the upgrade credentials so revoked keys and expired
-			// JWTs stop streaming within one ping interval.
-			// A rate-limit rejection means the credentials were valid (the
-			// limit is applied after a strategy succeeds), so it must not
-			// close a healthy stream.
-			if _, err := c.ws.authenticate(c.ctx, c.project, c.req, "eth_subscribe", nil); err != nil && c.ctx.Err() == nil &&
-				!common.HasErrorCode(err, common.ErrCodeAuthRateLimitRuleExceeded) {
-				c.closeWith(websocket.StatusPolicyViolation, "unauthorized")
-				return
-			}
+		if open != nil {
+			open()
 		}
+		return
 	}
-}
-
-// sendStream enqueues a subscription notification, waiting up to
-// WriteTimeout for queue space. Backpressure thus lands on the head cache's
-// per-subscription queue (which closes on overflow) instead of dropping a
-// client that is keeping up with a large block.
-func (c *wsConn) sendStream(msg []byte) bool {
-	select {
-	case c.out <- msg:
-		return true
-	case <-c.ctx.Done():
-		return false
-	default:
-	}
-	t := time.NewTimer(c.ws.cfg.WriteTimeout.Duration())
-	defer t.Stop()
-	select {
-	case c.out <- msg:
-		return true
-	case <-c.ctx.Done():
-		return false
-	case <-t.C:
-		c.closeWith(websocket.StatusPolicyViolation, wsCloseSlowConsumer)
-		return false
-	}
-}
-
-// send enqueues an RPC reply without blocking. A full queue disconnects the client.
-func (c *wsConn) send(msg []byte) bool {
-	if c.ctx.Err() != nil {
-		return false
-	}
-	select {
-	case c.out <- msg:
-		return true
-	default:
-		c.closeWith(websocket.StatusPolicyViolation, wsCloseSlowConsumer)
-		return false
-	}
-}
-
-type wsRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
-}
-
-func (c *wsConn) recordClose(reason string) {
-	telemetry.CounterHandle(telemetry.MetricWsClosedTotal, c.mProject, c.mNetwork, reason).Inc()
-}
-
-func errorReply(id json.RawMessage, code int, msg string) []byte {
-	if len(id) == 0 {
-		id = json.RawMessage("null")
-	}
-	b, _ := json.Marshal(msg)
-	return []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":%d,"message":%s}}`, id, code, b))
-}
-
-func resultReply(id json.RawMessage, result interface{}) []byte {
-	rb, _ := json.Marshal(result)
-	return []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":%s}`, id, rb))
-}
-
-// handleMessage processes one frame. The reply is enqueued before any
-// subscription pump starts so the id always precedes its notifications.
-func (c *wsConn) handleMessage(data []byte) {
-	reply, after := c.handleOne(bytes.TrimSpace(data))
-	delivered := false
-	if reply != nil {
-		delivered = c.send(reply)
-	}
-	if after != nil {
-		after(delivered)
-	}
-}
-
-// handleOne serves the subscription-only contract: eth_subscribe and
-// eth_unsubscribe. Batches and every other method are rejected; ordinary
-// JSON-RPC calls belong on HTTP.
-func (c *wsConn) handleOne(trimmed []byte) ([]byte, func(bool)) {
-	if len(trimmed) > 0 && trimmed[0] == '[' {
-		return errorReply(nil, int(common.JsonRpcErrorClientSideException), "batch requests are not supported over websocket"), nil
-	}
-	if !json.Valid(trimmed) {
-		return errorReply(nil, int(common.JsonRpcErrorParseException), "parse error"), nil
-	}
-	var req wsRequest
-	// Syntactically valid JSON that is not a request object is -32600.
-	if err := json.Unmarshal(trimmed, &req); err != nil || req.Method == "" {
-		return errorReply(nil, int(common.JsonRpcErrorClientSideException), "invalid request"), nil
-	}
-	if len(req.ID) == 0 {
-		req.ID = json.RawMessage("null")
-	}
-	if req.Method != "eth_subscribe" && req.Method != "eth_unsubscribe" {
-		return errorReply(req.ID, int(common.JsonRpcErrorUnsupportedException), fmt.Sprintf("method not supported over websocket: %s (use HTTP)", req.Method)), nil
-	}
-	nq := common.NewNormalizedRequest(trimmed)
-	nq.SetClientIP(c.clientIP)
-	if err := c.admit(c.ctx, nq, req.Method); errors.Is(err, errWsMethodDenied) {
-		return errorReply(req.ID, int(common.JsonRpcErrorUnsupportedException), "method not supported: "+req.Method), nil
-	} else if err != nil {
-		now := time.Now()
-		return c.render(processErrorBody(c.lg, &now, nq, err, c.ws.s.serverCfg.IncludeErrorDetails, common.NetworkArchitecture(c.network.Architecture()))), nil
-	}
-	if req.Method == "eth_unsubscribe" {
-		return c.unsubscribe(&req), nil
-	}
-	return c.subscribe(c.ctx, nq, &req)
-}
-
-func (c *wsConn) render(v interface{}) []byte {
-	var buf bytes.Buffer
 	var err error
-	if r, ok := v.(*HttpJsonRpcErrorResponse); ok {
-		_, err = writeJsonRpcError(&buf, r)
-	} else {
-		err = common.SonicCfg.NewEncoder(&buf).Encode(v)
+	switch v := out.(type) {
+	case *common.NormalizedResponse:
+		err = wsc.writeNormalizedResponse(v)
+	default:
+		if err = wsc.writeJSON(wsc.costBlock(ctx, []interface{}{v}), v); err != nil {
+			wsc.logger.Debug().Err(err).Str("connId", wsc.id).Msg("failed to write error response")
+		}
 	}
-	if err != nil {
-		c.lg.Warn().Err(err).Msg("failed to serialize websocket response")
-		return nil
+	// A failed write closes the connection, whose cleanup ends the
+	// subscription; it never writes.
+	if open != nil && err == nil {
+		open()
 	}
-	return bytes.TrimRight(buf.Bytes(), "\n")
 }
 
-// admit applies the HTTP gates relevant to subscriptions: validation,
-// ignore/allow methods and per-message consumer auth.
-func (c *wsConn) admit(ctx context.Context, nq *common.NormalizedRequest, method string) error {
+// handleRequest runs one JSON-RPC request through the same steps as the
+// HTTP handler and returns the response or error body to write.
+// Subscription methods are rejected in batches. A panic becomes an error
+// response carrying the request's id, since WebSocket clients match replies
+// by id. A new subscription comes with open, to call once out is written.
+func (wsc *WsConnection) handleRequest(ctx context.Context, raw []byte, startedAt *time.Time, inBatch bool) (out interface{}, notification bool, open func()) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			telemetry.MetricUnexpectedPanicTotal.WithLabelValues(
+				"ws-request-handler",
+				fmt.Sprintf("project:%s network:%s", wsc.project.Config.Id, wsc.networkId),
+				common.ErrorFingerprint(rec),
+			).Inc()
+			wsc.logger.Error().
+				Interface("panic", rec).
+				Str("stack", string(debug.Stack())).
+				Str("connId", wsc.id).
+				Msg("unexpected panic in websocket request handler")
+			// A fresh request: the panic may have left nq locked.
+			out = processErrorBody(wsc.logger, startedAt, common.NewNormalizedRequest(raw),
+				fmt.Errorf("unexpected server panic: %v", rec), wsc.server.serverCfg.IncludeErrorDetails, wsc.architecture)
+		}
+	}()
+
+	nq := common.NewNormalizedRequest(raw)
+	nq.ForwardHeaders = make(http.Header)
+	requestCtx := common.StartRequestSpan(ctx, nq)
+	nq.SetClientIP(wsc.server.resolveRealClientIP(wsc.httpReq))
+
+	fail := func(err error, includeDetails *bool) interface{} {
+		common.EndRequestSpan(requestCtx, nil, err)
+		return processErrorBody(wsc.logger, startedAt, nq, err, includeDetails, wsc.architecture)
+	}
+	unsupported := func(message string) interface{} {
+		common.EndRequestSpan(requestCtx, nil, nil)
+		return wsc.buildUnsupportedMethodResponse(nq, message)
+	}
+
 	if err := nq.Validate(); err != nil {
-		return err
+		return fail(err, &common.TRUE), notification, nil
 	}
-	pc := c.project.Config
-	handle := true
-	for _, m := range pc.IgnoreMethods {
-		if ok, _ := common.WildcardMatch(m, method); ok {
-			handle = false
-			break
-		}
+	// A valid request without an id is a notification: it runs, but gets no
+	// reply (JSON-RPC 2.0 §4.1). Invalid requests are still answered.
+	if jrr, err := nq.JsonRpcRequest(); err == nil {
+		notification = jrr.IsNotification()
 	}
-	for _, m := range pc.AllowMethods {
-		if ok, _ := common.WildcardMatch(m, method); ok {
-			handle = true
-			break
-		}
+
+	project := wsc.project
+	headers := wsc.httpReq.Header
+	queryArgs := wsc.httpReq.URL.Query()
+	if err := applyForwardHeaders(project, nq, headers); err != nil {
+		return fail(err, &common.TRUE), notification, nil
 	}
-	if !handle {
-		return errWsMethodDenied
-	}
-	user, err := c.ws.authenticate(ctx, c.project, c.req, method, nq)
+
+	method, _ := nq.Method()
+	allowed, err := isMethodAllowed(project, method)
 	if err != nil {
-		return err
+		return fail(err, &common.TRUE), notification, nil
+	}
+	if !allowed {
+		return unsupported(fmt.Sprintf("method not supported: %s", method)), notification, nil
+	}
+	if inBatch && IsSubscriptionMethod(method) {
+		return unsupported("subscription methods (eth_subscribe, eth_unsubscribe) are not supported in batch requests"), notification, nil
+	}
+
+	ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, headers, queryArgs)
+	if err != nil {
+		return fail(err, &common.TRUE), notification, nil
+	}
+	user, err := project.AuthenticateConsumer(requestCtx, nq, method, ap)
+	if err != nil {
+		return fail(err, wsc.server.serverCfg.IncludeErrorDetails), notification, nil
 	}
 	nq.SetUser(user)
-	if pc.TrustUserIdHeader && nq.User() == nil {
-		nq.SetUserFromTrustedHeader(c.req.Header.Get(common.HeaderUserId))
+	if project.Config.TrustUserIdHeader && nq.User() == nil {
+		nq.SetUserFromTrustedHeader(headers.Get(common.HeaderUserId))
 	}
-	nq.SetNetwork(c.network)
-	return nil
-}
 
-var errWsMethodDenied = errors.New("ws: method denied by project method lists")
-
-func newSubscriptionId() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	return "0x" + hex.EncodeToString(b[:])
-}
-
-func (c *wsConn) subscribe(ctx context.Context, nq *common.NormalizedRequest, req *wsRequest) ([]byte, func(bool)) {
-	var params []json.RawMessage
-	if err := json.Unmarshal(req.Params, &params); err != nil || len(params) == 0 {
-		return errorReply(req.ID, int(common.JsonRpcErrorInvalidArgument), "eth_subscribe requires a subscription type"), nil
+	nw, err := project.GetNetwork(requestCtx, wsc.networkId)
+	if err != nil {
+		return fail(err, wsc.server.serverCfg.IncludeErrorDetails), notification, nil
 	}
-	var kind string
-	if err := json.Unmarshal(params[0], &kind); err != nil {
-		return errorReply(req.ID, int(common.JsonRpcErrorInvalidArgument), "invalid subscription type"), nil
-	}
-	s := &wsSub{id: newSubscriptionId(), kind: kind}
-	switch kind {
-	case "newHeads":
-		if len(params) > 1 {
-			return errorReply(req.ID, int(common.JsonRpcErrorInvalidArgument), "newHeads takes no filter"), nil
-		}
-	case "logs":
-		s.logs = true
-		obj := map[string]interface{}{}
-		if len(params) > 1 {
-			if err := json.Unmarshal(params[1], &obj); err != nil || obj == nil {
-				return errorReply(req.ID, int(common.JsonRpcErrorInvalidArgument), "logs filter must be an object"), nil
-			}
-		}
-		f, err := headcache.ParseLogFilter(obj)
-		if err != nil {
-			return errorReply(req.ID, int(common.JsonRpcErrorInvalidArgument), err.Error()), nil
-		}
-		s.filter = f
+	nq.SetNetwork(nw)
+	applyRequestDirectives(project, nw, nq, headers, queryArgs)
+
+	var resp *common.NormalizedResponse
+	switch {
+	case IsSubscribeMethod(method):
+		resp, open, err = wsc.server.subscriptionManager.Subscribe(requestCtx, wsc, nq, project, wsc.networkId)
+	case IsSubscriptionMethod(method):
+		resp, err = wsc.server.subscriptionManager.Unsubscribe(requestCtx, wsc, nq, project, wsc.networkId)
 	default:
-		return errorReply(req.ID, int(common.JsonRpcErrorUnsupportedException), fmt.Sprintf("unsupported subscription type %q (supported: newHeads, logs)", kind)), nil
+		resp, err = project.Forward(requestCtx, wsc.networkId, nq)
+	}
+	if err != nil {
+		if resp != nil {
+			go resp.Release()
+		}
+		return fail(err, wsc.server.serverCfg.IncludeErrorDetails), notification, nil
 	}
 
-	hc := c.network.HeadCache()
-	if hc == nil {
-		return errorReply(req.ID, int(common.JsonRpcErrorUnsupportedException), "subscriptions unavailable: head cache is not enabled for this network"), nil
-	}
-	// Subscription setup consumes project rate-limit budget like any call.
-	if err := c.project.AcquireRateLimitPermit(ctx, nq); err != nil {
-		now := time.Now()
-		return c.render(processErrorBody(c.lg, &now, nq, err, c.ws.s.serverCfg.IncludeErrorDetails)), nil
-	}
+	common.EndRequestSpan(requestCtx, resp, nil)
+	return resp, notification, open
+}
 
-	c.mu.Lock()
-	if c.ctx.Err() != nil {
-		c.mu.Unlock()
-		return nil, nil
+func (wsc *WsConnection) handleBatch(ctx context.Context, raw []byte, startedAt *time.Time) {
+	var requests []json.RawMessage
+	if err := common.SonicCfg.Unmarshal(raw, &requests); err != nil {
+		wsc.writeError(int(common.JsonRpcErrorParseException), "parse error")
+		return
 	}
-	if len(c.subs) >= c.ws.cfg.MaxSubscriptionsPerConnection {
-		c.mu.Unlock()
-		return errorReply(req.ID, int(common.JsonRpcErrorCapacityExceeded), fmt.Sprintf("too many subscriptions on this connection (max %d)", c.ws.cfg.MaxSubscriptionsPerConnection)), nil
+	// JSON-RPC 2.0 section 6: an empty batch gets a single Invalid Request error.
+	if len(requests) == 0 {
+		wsc.writeError(int(common.JsonRpcErrorClientSideException), "invalid request: empty batch")
+		return
 	}
-	s.sub = hc.Subscribe(c.ws.cfg.SendQueueSize)
-	c.subs[s.id] = s
-	// Reserve the pump in the wait group while still registered so cleanup
-	// cannot finish before the deferred start runs.
-	c.wg.Add(1)
-	c.mu.Unlock()
-	telemetry.MetricWsSubscriptions.WithLabelValues(c.mProject, c.mNetwork, kind).Inc()
-
-	// The caller enqueues the id reply before starting the pump so no
-	// notification can precede it.
-	return resultReply(req.ID, s.id), func(delivered bool) {
-		if delivered {
-			go c.pump(s)
+	// The connection is bound to one network, so its limit covers the batch.
+	if nw, err := wsc.project.GetNetwork(ctx, wsc.networkId); err == nil {
+		if _, capErr := networkBatchCapError(nw, len(requests)); capErr != nil {
+			wsc.writeError(int(common.JsonRpcErrorClientSideException), capErr.(common.StandardError).DeepestMessage())
 			return
 		}
-		c.mu.Lock()
-		if c.subs[s.id] == s {
-			delete(c.subs, s.id)
-			telemetry.MetricWsSubscriptions.WithLabelValues(c.mProject, c.mNetwork, s.kind).Dec()
+	}
+
+	responses := make([]interface{}, len(requests))
+	notifications := make([]bool, len(requests))
+	var wg sync.WaitGroup
+
+	for i, reqBody := range requests {
+		wg.Add(1)
+		go func(index int, reqRaw json.RawMessage) {
+			defer wg.Done()
+			// Batches refuse subscribe, so nothing opens here.
+			responses[index], notifications[index], _ = wsc.handleRequest(ctx, reqRaw, startedAt, true)
+		}(i, reqBody)
+	}
+
+	wg.Wait()
+
+	// Notifications get no entry; a batch of only notifications gets no reply.
+	replies := make([]interface{}, 0, len(responses))
+	for i, resp := range responses {
+		if !notifications[i] {
+			replies = append(replies, resp)
 		}
-		c.mu.Unlock()
-		s.unsubscribed.Store(true)
-		s.sub.Close()
-		c.wg.Done()
+	}
+	// Costs cover notifications too, as on HTTP: they ran.
+	costs := wsc.costBlock(ctx, responses)
+	if len(replies) > 0 {
+		wsc.writeBatchResponse(costs, replies)
+	} else {
+		wsc.writeMeteringOnly(costs)
+	}
+
+	for _, resp := range responses {
+		if r, ok := resp.(*common.NormalizedResponse); ok {
+			go r.Release()
+		}
 	}
 }
 
-func (c *wsConn) unsubscribe(req *wsRequest) []byte {
-	var params []string
-	if err := json.Unmarshal(req.Params, &params); err != nil || len(params) != 1 {
-		return errorReply(req.ID, int(common.JsonRpcErrorInvalidArgument), "eth_unsubscribe requires a subscription id")
+func (wsc *WsConnection) buildUnsupportedMethodResponse(nq *common.NormalizedRequest, message string) *HttpJsonRpcErrorResponse {
+	jsonrpcVersion := "2.0"
+	var reqId interface{}
+	if jrr, err := nq.JsonRpcRequest(); err == nil {
+		jsonrpcVersion = jrr.JSONRPC
+		reqId = jrr.ResponseID(isSvmRequest(nq))
 	}
-	c.mu.Lock()
-	s, ok := c.subs[params[0]]
-	if ok {
-		delete(c.subs, params[0])
+	return &HttpJsonRpcErrorResponse{
+		Jsonrpc: jsonrpcVersion,
+		Id:      reqId,
+		Error: map[string]interface{}{
+			"code":    int(common.JsonRpcErrorUnsupportedException),
+			"message": message,
+		},
 	}
-	c.mu.Unlock()
-	if ok {
-		telemetry.MetricWsSubscriptions.WithLabelValues(c.mProject, c.mNetwork, s.kind).Dec()
-		s.unsubscribed.Store(true)
-		s.sub.Close()
-	}
-	return resultReply(req.ID, ok)
 }
 
-func (c *wsConn) notify(s *wsSub, result json.RawMessage) bool {
-	ok := c.sendStream([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":%q,"result":%s}}`, s.id, result)))
-	if ok {
-		telemetry.CounterHandle(telemetry.MetricWsNotificationsTotal, c.mProject, c.mNetwork, s.kind).Inc()
+// wsWriteDeadline bounds every write, so a stalled client cannot stall its
+// writer for longer, and every wait of a producer that cannot queue.
+var wsWriteDeadline = 10 * time.Second
+
+var errWsConnClosed = errors.New("connection closed")
+
+// headerCostFrames on the upgrade request opts the connection into cost
+// frames, when server.costHeaders is also on.
+const headerCostFrames = "X-ERPC-Cost-Frames"
+
+var crlf = []byte("\r\n")
+
+// costBlock is the cost frame header block for a response to items: the
+// HTTP cost header set in HTTP/1.1 wire form, without the closing blank
+// line. nil when cost frames are off or nothing was routed.
+func (wsc *WsConnection) costBlock(ctx context.Context, items []interface{}) []byte {
+	if !wsc.costFrames {
+		return nil
 	}
-	return ok
+	h := wsc.server.costHeaders(ctx, items)
+	if len(h) == 0 {
+		return nil
+	}
+	var b bytes.Buffer
+	_ = h.Write(&b)
+	return b.Bytes()
 }
 
-func (c *wsConn) pump(s *wsSub) {
-	defer c.wg.Done()
-	defer s.sub.Close()
+// notificationCostBlock is the cost frame header block of one subscription
+// notification: one billable eth_subscription call on the connection's
+// network. sub.NetworkID is the indexer's project-scoped key, not the
+// network id the response headers carry, so the connection's is used.
+func (wsc *WsConnection) notificationCostBlock(sub wsclient.Subscription) []byte {
+	if !wsc.costFrames {
+		return nil
+	}
+	kind := int(sub.Kind)
+	cacheable := kind >= 0 && kind < len(wsc.notifyCostBlocks)
+	if cacheable {
+		if b := wsc.notifyCostBlocks[kind].Load(); b != nil {
+			return *b
+		}
+	}
+	h := http.Header{}
+	h.Set("X-ERPC-Calls", "1")
+	h.Set("X-ERPC-Billable", "1")
+	h.Set("X-ERPC-Methods", "eth_subscription")
+	h.Set("X-ERPC-Subscription", sub.Kind.String())
+	h.Set("X-ERPC-Network-Id", wsc.networkId)
+	nw, err := wsc.project.GetNetwork(wsc.ctx, wsc.networkId)
+	if err == nil {
+		h.Set("X-ERPC-Network-Alias", nw.Label())
+	}
+	var buf bytes.Buffer
+	_ = h.Write(&buf)
+	b := buf.Bytes()
+	// Retry the alias next time if the network lookup failed.
+	if cacheable && err == nil {
+		wsc.notifyCostBlocks[kind].Store(&b)
+	}
+	return b
+}
+
+func (wsc *WsConnection) writeJSON(costs []byte, v interface{}) error {
+	return wsc.writeMessage(costs, func(w io.Writer) error {
+		return json.NewEncoder(w).Encode(v)
+	})
+}
+
+// writeError writes an error for a message that routed no call.
+func (wsc *WsConnection) writeError(code int, message string) {
+	_ = wsc.writeJSON(nil, map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      nil,
+		"error": map[string]interface{}{
+			"code":    code,
+			"message": message,
+		},
+	})
+}
+
+func (wsc *WsConnection) writeNormalizedResponse(resp *common.NormalizedResponse) error {
+	// Release even when the write never starts (connection closed or broken).
+	defer func() { go resp.Release() }()
+	err := wsc.writeMessage(wsc.costBlock(wsc.ctx, []interface{}{resp}), func(w io.Writer) error {
+		_, err := resp.WriteTo(w)
+		return err
+	})
+	if err != nil {
+		wsc.logger.Debug().Err(err).Str("connId", wsc.id).Msg("failed to write websocket response")
+	}
+	return err
+}
+
+func (wsc *WsConnection) writeBatchResponse(costs []byte, responses []interface{}) {
+	_ = wsc.writeMessage(costs, func(w io.Writer) error {
+		_, err := NewBatchResponseWriter(responses).WriteTo(w)
+		return err
+	})
+}
+
+// writeMeteringOnly writes a cost block with an empty body for calls that
+// ran but get no reply (id-less notifications), so a metering proxy still
+// sees them. Nothing is written without cost frames or routed items.
+func (wsc *WsConnection) writeMeteringOnly(costs []byte) {
+	if len(costs) == 0 {
+		return
+	}
+	_ = wsc.writeMessage(costs, func(io.Writer) error { return nil })
+}
+
+func (wsc *WsConnection) pingLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
 	for {
 		select {
-		case <-c.ctx.Done():
+		case <-ticker.C:
+			// WriteControl is safe alongside the data writer, so pings don't
+			// wait behind a slow data write.
+			err := wsc.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteDeadline))
+			wsc.logger.Trace().Str("connId", wsc.id).Msg("websocket ping sent")
+			if err != nil {
+				wsc.logger.Info().Err(err).Str("connId", wsc.id).
+					Str("errType", fmt.Sprintf("%T", err)).
+					Msg("websocket ping failed, closing connection")
+				wsc.stop(websocket.CloseGoingAway, "", 0)
+				return
+			}
+		case <-wsc.stopped:
 			return
-		case ev, ok := <-s.sub.C:
-			if !ok {
-				if !s.unsubscribed.Load() && c.ctx.Err() == nil {
-					// Overflow or cache stop: the client missed events and
-					// must reconnect rather than see a silent gap.
-					c.closeWith(websocket.StatusPolicyViolation, "subscription closed: "+wsCloseSlowConsumer+" or head cache stopped")
-				}
-				return
-			}
-			if err := c.emit(s, ev); errors.Is(err, errWsGap) {
-				// Missing heights (evicted records, window reset, recovery
-				// after staleness): the client must resync, never skip.
-				c.closeWith(websocket.StatusPolicyViolation, "subscription gap: resubscribe")
-				return
-			} else if err != nil {
-				c.lg.Warn().Err(err).Str("subscription", s.id).Msg("failed to render subscription event")
-				c.closeWith(websocket.StatusInternalError, "failed to render subscription event")
-				return
-			}
 		}
 	}
 }
 
-var errWsGap = errors.New("head discontinuity")
+// stop ends the connection with the given close code: it stops reading new
+// requests and lets teardown finish. Requests already in flight get up to
+// grace to complete. Only the first call counts; safe from any goroutine.
+func (wsc *WsConnection) stop(code int, reason string, grace time.Duration) {
+	wsc.stopOnce.Do(func() {
+		wsc.closeCode, wsc.closeReason, wsc.closeGrace = code, reason, grace
+		close(wsc.stopped)
+		_ = wsc.conn.SetReadDeadline(time.Now())
+	})
+}
 
-// checkContinuity verifies an event extends what the subscriber has seen:
-// Added must be contiguous and start right after the last emitted block, or
-// right at the lowest Removed block for a reorg rewind. The first event of a
-// subscription establishes the baseline.
-func checkContinuity(last int64, ev headcache.Event) error {
-	for i := 1; i < len(ev.Added); i++ {
-		if ev.Added[i].Number != ev.Added[i-1].Number+1 {
-			return errWsGap
-		}
+// teardown runs on the read loop's goroutine once it exits, so no request
+// can start while it waits for in-flight ones.
+func (wsc *WsConnection) teardown() {
+	// Server-initiated unless stop() said otherwise; never 1000, which
+	// would tell the client nothing went wrong.
+	wsc.stop(websocket.CloseGoingAway, "", 0)
+
+	if wsc.closeGrace > 0 {
+		wsc.waitInflight(wsc.closeGrace)
 	}
-	for i := 1; i < len(ev.Removed); i++ {
-		if ev.Removed[i].Number != ev.Removed[i-1].Number-1 {
-			return errWsGap
-		}
+	// Cancelled requests still write their JSON-RPC error before the close.
+	wsc.cancel()
+	wsc.waitInflight(wsWriteDeadline)
+	wsc.closed.Store(true)
+
+	wsc.server.subscriptionManager.CleanupConnection(wsc)
+	// The close frame follows the last data message.
+	wsc.stopWriter()
+
+	if !wsc.peerClosed.Load() {
+		_ = wsc.conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(wsc.closeCode, wsc.closeReason),
+			time.Now().Add(wsWriteDeadline),
+		)
 	}
-	if last == 0 {
+	_ = wsc.conn.Close()
+	wsc.server.activeWsConns.Delete(wsc.id)
+	telemetry.GaugeHandle(telemetry.MetricWebsocketConnectionsActive, wsc.project.Config.Id).Dec()
+	close(wsc.done)
+
+	wsc.logger.Info().Str("connId", wsc.id).Int("closeCode", wsc.closeCode).Msg("websocket connection closed")
+}
+
+func (wsc *WsConnection) waitInflight(timeout time.Duration) {
+	idle := make(chan struct{})
+	go func() {
+		wsc.inflight.Wait()
+		close(idle)
+	}()
+	select {
+	case <-idle:
+	case <-time.After(timeout):
+	}
+}
+
+// wsNotifier writes one subscription's eth_subscription notifications. The
+// envelope is spliced around the payload bytes as they came, so no
+// notification is encoded again per subscriber, and the metric handles are
+// bound once.
+type wsNotifier struct {
+	wsc *WsConnection
+	sub wsclient.Subscription
+	// prefix is the envelope up to the result:
+	// {"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"<id>","result":
+	prefix      []byte
+	sent, bytes *telemetry.BoundCounter
+}
+
+var (
+	wsNotificationHead   = []byte(`{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":`)
+	wsNotificationResult = []byte(`,"result":`)
+	wsNotificationSuffix = []byte("}}\n")
+)
+
+func (wsc *WsConnection) notifier(sub wsclient.Subscription) *wsNotifier {
+	id, _ := json.Marshal(sub.ClientSubID)
+	prefix := slices.Concat(wsNotificationHead, id, wsNotificationResult)
+	labels := []string{wsc.project.Config.Id, wsc.networkLabel, sub.Kind.String()}
+	return &wsNotifier{
+		wsc: wsc, sub: sub, prefix: prefix,
+		sent:  telemetry.BindCounter(telemetry.MetricWebsocketNotificationsSentTotal, labels...),
+		bytes: telemetry.BindCounter(telemetry.MetricWebsocketNotificationBytesTotal, labels...),
+	}
+}
+
+// write queues one notification carrying result, valid JSON as is; the
+// writer skips it once the subscription is removed, and calls d.done once
+// it is written.
+func (n *wsNotifier) write(result json.RawMessage, d tapDelivery) error {
+	if n.sub.Removed() {
 		return nil
 	}
-	next := last + 1
-	if len(ev.Removed) > 0 {
-		lowest := ev.Removed[len(ev.Removed)-1].Number
-		if ev.Removed[0].Number > last || lowest > next {
-			return errWsGap
-		}
-		next = lowest
-	}
-	if len(ev.Added) > 0 && ev.Added[0].Number != next {
-		return errWsGap
-	}
-	return nil
-}
-
-func (c *wsConn) emit(s *wsSub, ev headcache.Event) error {
-	if err := checkContinuity(s.last, ev); err != nil {
+	msg, err := n.wsc.encodeMessage(n.wsc.notificationCostBlock(n.sub), func(w io.Writer) error {
+		_, _ = w.Write(n.prefix)
+		_, _ = w.Write(result)
+		_, err := w.Write(wsNotificationSuffix)
+		return err
+	})
+	if err != nil {
 		return err
 	}
-	if len(ev.Added) > 0 {
-		s.last = ev.Added[len(ev.Added)-1].Number
-	} else if len(ev.Removed) > 0 {
-		s.last = ev.Removed[len(ev.Removed)-1].Number - 1
-	}
-	if !s.logs {
-		for _, rec := range ev.Added {
-			h, err := rec.HeaderJSON()
-			if err != nil {
-				return err
-			}
-			if !c.notify(s, h) {
-				return nil
-			}
-		}
-		return nil
-	}
-	for _, rec := range ev.Removed {
-		logs, err := rec.FilterLogs(s.filter, true)
-		if err != nil {
-			return err
-		}
-		for _, l := range logs {
-			if !c.notify(s, l) {
-				return nil
-			}
-		}
-	}
-	for _, rec := range ev.Added {
-		logs, err := rec.FilterLogs(s.filter, false)
-		if err != nil {
-			return err
-		}
-		for _, l := range logs {
-			if !c.notify(s, l) {
-				return nil
-			}
-		}
-	}
-	return nil
+	return n.wsc.queue(wsOut{msg: msg, note: n, size: len(n.prefix) + len(result) + len(wsNotificationSuffix), delivery: d})
 }

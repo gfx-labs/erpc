@@ -23,7 +23,8 @@ func TestVennParityExampleConfigLoads(t *testing.T) {
 	require.True(t, nw.Evm.HeadCache.Enabled)
 	require.NoError(t, nw.Evm.HeadCache.ValidateConnector(cfg))
 	require.NotNil(t, cfg.Server.WebSocket)
-	require.True(t, cfg.Server.WebSocket.Enabled)
+	require.NotNil(t, cfg.Server.WebSocket.Enabled)
+	require.True(t, *cfg.Server.WebSocket.Enabled)
 	for _, fs := range nw.Failsafe {
 		require.True(t, fs.Hedge == nil || fs.Hedge.MaxCount <= 0, "example must keep hedging off")
 	}

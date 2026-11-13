@@ -13,8 +13,10 @@ import (
 // pollerAtSlot is a minimal SvmStatePoller used for slot-lag filter tests.
 // It reports a fixed finalized slot and stubs out everything else.
 type pollerAtSlot struct {
-	slot int64
-	null bool
+	slot       int64
+	null       bool
+	floor      int64
+	floorKnown bool
 }
 
 func (p *pollerAtSlot) Bootstrap(context.Context) error   { return nil }
@@ -28,6 +30,10 @@ func (p *pollerAtSlot) IsHealthy() bool                   { return true }
 func (p *pollerAtSlot) SuggestLatestSlot(int64)           {}
 func (p *pollerAtSlot) SuggestFinalizedSlot(int64)        {}
 func (p *pollerAtSlot) SetDebounceInterval(time.Duration) {}
+func (p *pollerAtSlot) SetSkipProcessedSlotProbe(bool)    {}
+func (p *pollerAtSlot) FirstAvailableSlot() (int64, bool) {
+	return p.floor, p.floorKnown
+}
 
 // slotLagUpstream is a per-id SvmUpstream stub — svmUpstreamStub in
 // hooks_test.go has a fixed id so it can't be reused for multi-upstream
@@ -132,28 +138,6 @@ func TestFilterByFinalizedSlotLag_IncludesUnreadyPollers(t *testing.T) {
 	got := FilterByFinalizedSlotLag(ups, 100, 1000)
 	if len(got) != 2 {
 		t.Fatalf("warming-up upstream must not be filtered; got %d", len(got))
-	}
-}
-
-func TestHighestFinalizedSlot_PicksMaxAcrossUpstreams(t *testing.T) {
-	t.Parallel()
-	ups := []common.Upstream{
-		upstreamAt("a", 500),
-		upstreamAt("b", 1200),
-		upstreamAt("c", 900),
-	}
-	if got := HighestFinalizedSlot(ups); got != 1200 {
-		t.Fatalf("expected 1200, got %d", got)
-	}
-}
-
-func TestHighestFinalizedSlot_ZeroWhenNoSvmUpstreams(t *testing.T) {
-	t.Parallel()
-	// stubSvm (from error_normalizer_test.go) implements common.Upstream but
-	// not common.SvmUpstream — no SvmStatePoller method.
-	nonSvm := newSvmStub()
-	if got := HighestFinalizedSlot([]common.Upstream{nonSvm}); got != 0 {
-		t.Fatalf("non-svm upstreams must contribute 0, got %d", got)
 	}
 }
 

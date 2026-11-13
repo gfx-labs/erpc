@@ -7,6 +7,7 @@ import (
 	"github.com/erpc/erpc/common"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // testNetwork is a simple test implementation of common.Network interface for this file
@@ -52,16 +53,11 @@ func (t *testNetwork) Logger() *zerolog.Logger {
 	return &logger
 }
 
-func (t *testNetwork) EvmHighestLatestBlockNumber(ctx context.Context) int64 {
-	return t.highestLatest
+func (t *testNetwork) EvmHead(ctx context.Context, req *common.NormalizedRequest) common.EvmHead {
+	return common.EvmHead{Latest: t.highestLatest}
 }
-
-func (t *testNetwork) EvmHighestFinalizedBlockNumber(ctx context.Context) int64 {
-	return 0
-}
-
-func (t *testNetwork) EvmLeaderUpstream(ctx context.Context) common.Upstream {
-	return nil
+func (t *testNetwork) EvmLaneHead(string, string) common.EvmHead {
+	return t.EvmHead(context.Background(), nil)
 }
 
 func (t *testNetwork) GetMethodMetrics(method string) common.TrackedMetrics {
@@ -167,6 +163,32 @@ func TestEnforceNonNullTaggedBlocks(t *testing.T) {
 		// Assert: Should return null without error for "latest" tag when enforcement is disabled
 		assert.NoError(t, err)
 		assert.NotNil(t, result)
+		assert.True(t, result.IsResultEmptyish())
+	})
+
+	// #477: "latest" is interpolated to the Head's number, and the null-for-tag
+	// opt-out still reads the tag the client sent.
+	t.Run("InterpolatedLatestTagWithEnforcementDisabled_ReturnsNull", func(t *testing.T) {
+		request := common.NewNormalizedRequestFromJsonRpcRequest(
+			common.NewJsonRpcRequest("eth_getBlockByNumber", []interface{}{"latest", true}),
+		)
+		request.SetNetwork(&testNetwork{highestLatest: 0x20})
+		request.SetDirectives(&common.RequestDirectives{
+			EnforceNonNullTaggedBlocks: false,
+		})
+		jrq, err := request.JsonRpcRequest()
+		require.NoError(t, err)
+		NormalizeHttpJsonRpc(context.Background(), request, jrq)
+		require.Equal(t, "0x20", jrq.Params[0], "latest must be interpolated to the Head")
+
+		jsonResp, _ := common.NewJsonRpcResponse(1, nil, nil)
+		response := common.NewNormalizedResponse().
+			WithRequest(request).
+			WithJsonRpcResponse(jsonResp)
+
+		result, err := enforceNonNullBlock(context.Background(), request, response)
+		assert.NoError(t, err)
+		require.NotNil(t, result)
 		assert.True(t, result.IsResultEmptyish())
 	})
 

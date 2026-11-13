@@ -1,11 +1,11 @@
 # Venn-parity example: an indexer-facing eRPC fleet with several replicas.
 #
-# Two required components:
+# Two components:
 #   - evm.headCache: one replica per network holds a Redis lease, hydrates recent
 #     canonical blocks + logs, and every replica serves them. It reuses a Redis
 #     connector from database.evmJsonRpcCache.connectors (connectorId).
-#   - server.webSocket: eth_subscribe newHeads/logs fed by the head cache.
-#     Only eth_subscribe / eth_unsubscribe are accepted over WS.
+#   - server.webSocket: eth_subscribe newHeads/logs for indexers, served by the
+#     network's chain tracker.
 # Optional, existing config only:
 #   - selectionPolicy.evalFunc sorts cheap upstreams first, and the network
 #     failsafe has no hedge, so client requests are forwarded to paid only
@@ -33,8 +33,6 @@ server:
     # Per process, not per fleet. Put a per-client connection limit in front.
     maxConnections: 1024
     maxSubscriptionsPerConnection: 32
-    # A client that falls this far behind is disconnected (1008), never buffered unbounded.
-    sendQueueSize: 256
 
 metrics:
   enabled: true

@@ -122,6 +122,8 @@ Use `IsFinalizedCommitment` semantics when reasoning about which upstream can se
 | options slot holds a non-object (legacy `getBlock(slot, "base64")` encoding form) | `""`, injection skipped — a valid request shape is never corrupted |
 | required positional args missing (including `getBlocks` with no start slot) | `""`, injection skipped |
 
+**Config-less reads get `{}` when nothing is pinned.** Some providers treat the optional config object of `getBlock`, `getTransaction` and `getProgramAccounts` as required, and answer a request without it with `-32602` "Invalid params" (`missing value for required argument 1`). With no network default, eRPC appends `{}` to such a request (e.g. `getBlock [slot]` becomes `[slot, {}]`). Agave's config for these methods has only optional fields, so `{}` means exactly agave's defaults, and `[slot]` and `[slot, {}]` share one cache key. Methods whose config is a bare commitment object (`getTokenSupply`, `getInflationGovernor`, …) never get `{}`: agave answers it with `-32602` "missing field `commitment`".
+
 **Injection runs at the project layer, before the cache read.** Despite the hook's name it is invoked from `HandleProjectPreForward`, ahead of the network-layer cache lookup, and it invalidates the memoized `CacheHash` so the cache keys on the rewritten body. Running it after the cache read would key every request on its pre-injection params and produce a permanent cache miss.
 
 **Options-index table.** Solana puts the config object at a different param position per method, so injection is table-driven:
@@ -297,7 +299,7 @@ Commitment injection emits no metrics of its own — it is a params rewrite. Its
 
 ### Source code entry points
 
-- [`architecture/svm/hooks.go`](https://github.com/erpc/erpc/blob/main/architecture/svm/hooks.go) — `resolveCommitment`, `effectiveCommitment`, `solanaDefaultCommitment`, `commitmentOptionsIndex`, `atLeastConfirmedMethods`, `clampCommitmentForMethod`, `writeCommitmentField`, `networkPreForward_injectCommitment`, `networkPreForward_injectWriteCommitment`, `projectPreForward_getGenesisHash`.
+- [`architecture/svm/hooks.go`](https://github.com/erpc/erpc/blob/main/architecture/svm/hooks.go) — `resolveCommitment`, `effectiveCommitment`, `FailsafeCommitment` (the level failsafe `matchCommitment` compares), `solanaDefaultCommitment`, `commitmentOptionsIndex`, `atLeastConfirmedMethods`, `clampCommitmentForMethod`, `writeCommitmentField`, `networkPreForward_injectCommitment`, `networkPreForward_injectWriteCommitment`, `projectPreForward_getGenesisHash`.
 - [`architecture/svm/finality.go`](https://github.com/erpc/erpc/blob/main/architecture/svm/finality.go) — `GetFinality`, `IsFinalizedCommitment`, and the moving-head rationale.
 - [`architecture/svm/slot_lag.go`](https://github.com/erpc/erpc/blob/main/architecture/svm/slot_lag.go) — `FilterByMinContextSlot`, `MinContextSlotOf`, `isAtOrAheadOfSlot`.
 - <SourceLink file="common/config.go" lines="2336-2342" label="common/config.go — SvmNetworkConfig.Commitment" />
@@ -307,7 +309,8 @@ Commitment injection emits no metrics of its own — it is a params rewrite. Its
 - [SVM slot tracking & health](/reference/svm/slot-tracking) — the state poller, `getSlot` correction, ingestion lag, and cordoning.
 - [SVM JSON-RPC cache](/config/database/svm-json-rpc-cache) — the finality classification tables and cache-key derivation.
 - [Networks](/config/projects/networks) — declaring an SVM network and the full `svm.*` schema.
-- [Consensus](/config/failsafe/consensus) — how `matchFinality` gates a consensus policy.
+- [Consensus](/config/failsafe/consensus) — how `matchFinality` and `matchCommitment` gate a consensus policy.
+- [Matchers](/config/matcher) — `matchCommitment` semantics vs `matchFinality`.
 - [Error taxonomy](/reference/errors#svm-solana-error-contract) — `-32016` and the rest of the SVM error contract.
 
 </AISection>
