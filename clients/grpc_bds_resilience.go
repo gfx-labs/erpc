@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -23,6 +25,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
 )
 
 // Hard-coded resilience tunables. Kept inline (not config-driven) until
@@ -51,8 +54,10 @@ var (
 	bdsStuckCallThreshold = 3
 	bdsStuckCallWindow    = 60 * time.Second
 
-	// bdsReplacementDedupWindow stops two simultaneous threshold-breaches
-	// from double-closing the same slot in quick succession.
+	// bdsReplacementDedupWindow is the minimum gap between replacements of
+	// one slot: it stops two simultaneous threshold-breaches from
+	// double-closing a slot, and an unreachable endpoint from turning the
+	// unservable re-dial (watchServable) into a dial loop.
 	bdsReplacementDedupWindow = 5 * time.Second
 
 	// bdsConnMaxAge bounds how long a pooled connection may live before the
@@ -120,6 +125,9 @@ type bdsPool struct {
 	target        string
 	creds         credentials.TransportCredentials
 	serviceConfig string
+	// methodPrefix is prepended to every call's method (see
+	// methodPrefixInterceptors); "" for a server at the root path.
+	methodPrefix string
 
 	// poolMu protects every read/write of p.conns. Pick takes RLock so
 	// the hot path stays cheap; replaceConn and Shutdown take Lock when
@@ -140,6 +148,11 @@ type bdsPool struct {
 	// atomic because the cache connector arms it after probing the server.
 	appCtx          context.Context
 	expectedChainId atomic.Uint64
+	// md is the client's outgoing metadata (its headers), attached to the
+	// pool's own ChainId probes so an auth gateway in front of the server
+	// accepts them like any request. Atomic because SetHeaders may refresh it
+	// after construction.
+	md              atomic.Pointer[metadata.MD]
 	stopCh          chan struct{}
 	stopOnce        sync.Once
 }
@@ -153,11 +166,12 @@ type bdsPool struct {
 func newBdsPool(
 	appCtx context.Context,
 	logger *zerolog.Logger,
-	projectId, upstreamId, target string,
+	projectId, upstreamId, target, methodPrefix string,
 	creds credentials.TransportCredentials,
 	serviceConfig string,
 	poolSize int,
 	expectedChainId uint64,
+	md metadata.MD,
 ) (*bdsPool, error) {
 	if poolSize <= 0 {
 		poolSize = bdsPoolSize
@@ -169,6 +183,7 @@ func newBdsPool(
 		target:        target,
 		creds:         creds,
 		serviceConfig: serviceConfig,
+		methodPrefix:  methodPrefix,
 		conns:         make([]*bdsConn, poolSize),
 		projectId:     projectId,
 		upstreamId:    upstreamId,
@@ -177,6 +192,7 @@ func newBdsPool(
 		stopCh:        make(chan struct{}),
 	}
 	p.expectedChainId.Store(expectedChainId)
+	p.md.Store(&md)
 	for i := 0; i < poolSize; i++ {
 		c, err := p.dial()
 		if err != nil {
@@ -216,6 +232,9 @@ func (p *bdsPool) verifyConn(ctx context.Context, c *bdsConn) (bool, uint64, err
 	}
 	vctx, cancel := context.WithTimeout(ctx, bdsVerifyTimeout)
 	defer cancel()
+	if md := p.md.Load(); md != nil && len(*md) > 0 {
+		vctx = metadata.NewOutgoingContext(vctx, *md)
+	}
 	resp, err := c.rpcClient.ChainId(vctx, &evm.ChainIdRequest{})
 	if err != nil {
 		return false, 0, err
@@ -283,10 +302,11 @@ func (p *bdsPool) maintainLoop() {
 }
 
 // recycleConn dials a verified replacement for c and swaps it into c's slot.
-// reason is `age`, `chainid_mismatch` or `closed`. On age recycles the old
-// conn closes after a linger (lets in-flight RPCs finish; new picks already go
-// to the replacement); on mismatch/closed the old conn is already closed (or
-// closes immediately) — a proven wrong-chain conn must not serve another call.
+// reason is `age`, `unservable`, `chainid_mismatch` or `closed`. On age and
+// unservable recycles the old conn closes after a linger (lets in-flight RPCs
+// finish; new picks already go to the replacement); on mismatch/closed the old
+// conn is already closed (or closes immediately) — a proven wrong-chain conn
+// must not serve another call.
 func (p *bdsPool) recycleConn(c *bdsConn, reason string) {
 	replacement, err := p.dial()
 	if err != nil {
@@ -315,7 +335,7 @@ func (p *bdsPool) recycleConn(c *bdsConn, reason string) {
 		Str("reason", reason).
 		Msg("BDS maintainer: recycled pool connection")
 	if c.conn != nil {
-		if reason == "age" {
+		if reason == "age" || reason == "unservable" {
 			old := c.conn
 			time.AfterFunc(bdsAgeRecycleLinger, func() { _ = old.Close() })
 		} else {
@@ -330,13 +350,7 @@ func (p *bdsPool) recycleConn(c *bdsConn, reason string) {
 func (p *bdsPool) swapInReplacement(c, replacement *bdsConn) (int, bool) {
 	p.poolMu.Lock()
 	defer p.poolMu.Unlock()
-	slot := -1
-	for i, existing := range p.conns {
-		if existing == c {
-			slot = i
-			break
-		}
-	}
+	slot := p.slotOfLocked(c)
 	if slot < 0 {
 		return -1, false
 	}
@@ -348,6 +362,55 @@ func (p *bdsPool) swapInReplacement(c, replacement *bdsConn) (int, bool) {
 	return slot, true
 }
 
+// slotOfLocked returns c's slot, or -1 when c is not pooled. Caller holds poolMu.
+func (p *bdsPool) slotOfLocked(c *bdsConn) int {
+	for i, existing := range p.conns {
+		if existing == c {
+			return i
+		}
+	}
+	return -1
+}
+
+// watchServable recycles c's slot once c's channel has no address it may send
+// to (TRANSIENT_FAILURE): every address refuses connections or, with a health
+// check, reports NOT_SERVING. grpc-go re-resolves a name only after a
+// connection breaks, and a health failure breaks none, so calls would queue on
+// a draining server until its listener closes. A fresh dial resolves the name
+// again, finding a replacement server's address, and opens new connections, so
+// a load balancer routes them to a backend still serving. Runs for c's life;
+// started by dial.
+func (p *bdsPool) watchServable(c *bdsConn) {
+	lastTry := c.dialedAt
+	state := c.conn.GetState()
+	for state != connectivity.Shutdown {
+		if state == connectivity.TransientFailure {
+			if wait := bdsReplacementDedupWindow - time.Since(lastTry); wait > 0 {
+				select {
+				case <-time.After(wait):
+				case <-p.stopCh:
+					return
+				case <-p.appCtx.Done():
+					return
+				}
+			}
+			if c.conn.GetState() == connectivity.TransientFailure {
+				lastTry = time.Now()
+				p.recycleConn(c, "unservable")
+				p.poolMu.RLock()
+				pooled := p.slotOfLocked(c) >= 0
+				p.poolMu.RUnlock()
+				if !pooled {
+					return
+				}
+			}
+		} else if !c.conn.WaitForStateChange(p.appCtx, state) {
+			return
+		}
+		state = c.conn.GetState()
+	}
+}
+
 // Size returns the number of connection slots in the pool.
 func (p *bdsPool) Size() int {
 	p.poolMu.RLock()
@@ -356,12 +419,18 @@ func (p *bdsPool) Size() int {
 }
 
 func (p *bdsPool) dial() (*bdsConn, error) {
-	conn, err := grpc.NewClient(p.target,
+	opts := []grpc.DialOption{
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 		grpc.WithTransportCredentials(p.creds),
 		grpc.WithChainUnaryInterceptor(grpcResponseMetadataInterceptor()),
 		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(100*1024*1024),
+			// No client-side bound on a reply: a BDS server answers what the
+			// request asked for, and a wide eth_getLogs on a busy chain runs
+			// past any fixed size (Ethereum: ~100 MB per 1,000 blocks). The
+			// HTTP upstream client reads bodies unbounded too; the bound on a
+			// reply's size is the range the network allows
+			// (getLogsMaxAllowedRange). MaxInt32 is protobuf's own message limit.
+			grpc.MaxCallRecvMsgSize(math.MaxInt32),
 			grpc.MaxCallSendMsgSize(100*1024*1024),
 		),
 		grpc.WithDefaultServiceConfig(p.serviceConfig),
@@ -379,7 +448,8 @@ func (p *bdsPool) dial() (*bdsConn, error) {
 				MaxDelay:   1 * time.Second,
 			},
 		}),
-	)
+	}
+	conn, err := grpc.NewClient(p.target, append(opts, methodPrefixInterceptors(p.methodPrefix)...)...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial gRPC server at %s: %w", p.target, err)
 	}
@@ -388,14 +458,16 @@ func (p *bdsPool) dial() (*bdsConn, error) {
 		// ±20% jitter so pool conns never expire in lockstep.
 		maxAge = time.Duration(float64(bdsConnMaxAge) * (0.8 + 0.4*rand.Float64())) // #nosec G404 -- recycle-spread jitter, not security-sensitive
 	}
-	return &bdsConn{
+	c := &bdsConn{
 		conn:        conn,
 		rpcClient:   evm.NewRPCQueryServiceClient(conn),
 		queryClient: evm.NewQueryServiceClient(conn),
 		svmClient:   svm.NewRPCQueryServiceClient(conn),
 		dialedAt:    time.Now(),
 		maxAge:      maxAge,
-	}, nil
+	}
+	go p.watchServable(c)
+	return c, nil
 }
 
 // Pick returns the next pool slot in round-robin order.
@@ -519,18 +591,51 @@ func callBoundedT[T any](ctx context.Context, fn func(context.Context) (T, error
 	return util.BoundedCallT(ctx, fn)
 }
 
-// pickTargetForBDS extracts the host:port + TLS choice from an upstream URL.
-func pickTargetForBDS(parsedUrl *url.URL) (target string, useTLS bool) {
-	target = parsedUrl.Host
-	if parsedUrl.Port() == "" {
-		target = fmt.Sprintf("%s:50051", parsedUrl.Hostname())
-	}
-	target = fmt.Sprintf("dns:///%s", target)
-
+// pickTargetForBDS extracts the host:port, the method path prefix, and the TLS
+// choice from an upstream URL.
+//
+// TLS is on for port 443 or a `grpcs`/`*tls*` scheme. A URL without a port
+// dials 443 when TLS is on and 50051 otherwise, so `grpcs://edge.goldsky.com`
+// reaches the TLS front door rather than a plaintext port.
+//
+// pathPrefix is the URL path without its trailing slash ("" for none). A
+// server mounted below a path selector — `grpcs://edge.goldsky.com/boost`
+// serves `/boost/bds.evm.RPCQueryService/...` — needs every call's method
+// prefixed with it; gRPC itself has no notion of a base path.
+func pickTargetForBDS(parsedUrl *url.URL) (target, pathPrefix string, useTLS bool) {
 	if portNum, err := strconv.Atoi(parsedUrl.Port()); err == nil && portNum == 443 {
 		useTLS = true
 	} else if strings.HasPrefix(parsedUrl.Scheme, "grpcs") || strings.Contains(parsedUrl.Scheme, "tls") {
 		useTLS = true
 	}
-	return target, useTLS
+
+	target = parsedUrl.Host
+	if parsedUrl.Port() == "" {
+		port := "50051"
+		if useTLS {
+			port = "443"
+		}
+		target = net.JoinHostPort(parsedUrl.Hostname(), port)
+	}
+	target = fmt.Sprintf("dns:///%s", target)
+	pathPrefix = strings.TrimRight(parsedUrl.Path, "/")
+	return target, pathPrefix, useTLS
+}
+
+// methodPrefixInterceptors rewrite every unary and streaming call's full
+// method name to prefix + method, so `/bds.evm.RPCQueryService/ChainId`
+// reaches `/boost/bds.evm.RPCQueryService/ChainId`. Nil for an empty prefix:
+// the common case adds nothing to the call path.
+func methodPrefixInterceptors(prefix string) []grpc.DialOption {
+	if prefix == "" {
+		return nil
+	}
+	return []grpc.DialOption{
+		grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+			return invoker(ctx, prefix+method, req, reply, cc, opts...)
+		}),
+		grpc.WithChainStreamInterceptor(func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+			return streamer(ctx, desc, cc, prefix+method, opts...)
+		}),
+	}
 }
