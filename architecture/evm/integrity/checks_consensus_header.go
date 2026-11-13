@@ -3,7 +3,10 @@ package integrity
 import (
 	"context"
 	"math/big"
+	"strconv"
 	"strings"
+
+	"github.com/erpc/erpc/common"
 )
 
 // emptyUnclesHash is keccak256(rlp([])) — the sha3Uncles of a block with no
@@ -39,19 +42,29 @@ func init() {
 			}
 			checked := false
 
-			if cfg.boolParam("emptyUncles", false) && h.Sha3Uncles != "" {
+			// The regime constants hold only from the declared activation
+			// block; a header before it, or whose number cannot be read, is
+			// not judged on them.
+			regime := true
+			if from := cfg.param("activeFromBlock", ""); from != "" {
+				activation, err1 := strconv.ParseUint(from, 10, 64)
+				n, err2 := common.HexToInt64(h.Number)
+				regime = err1 == nil && err2 == nil && n >= 0 && uint64(n) >= activation
+			}
+
+			if regime && cfg.boolParam("emptyUncles", false) && h.Sha3Uncles != "" {
 				checked = true
 				if !strings.EqualFold(h.Sha3Uncles, emptyUnclesHash) {
 					return failf("sha3Uncles %s is not the empty-ommers hash, which this chain's consensus fixes", h.Sha3Uncles)
 				}
 			}
-			if cfg.boolParam("zeroDifficulty", false) && h.Difficulty != "" {
+			if regime && cfg.boolParam("zeroDifficulty", false) && h.Difficulty != "" {
 				checked = true
 				if !isZeroHex(h.Difficulty) {
 					return failf("difficulty %s is non-zero on a chain whose consensus fixes it at zero", h.Difficulty)
 				}
 			}
-			if cfg.boolParam("zeroNonce", false) && h.Nonce != "" {
+			if regime && cfg.boolParam("zeroNonce", false) && h.Nonce != "" {
 				checked = true
 				if !isZeroHex(h.Nonce) {
 					return failf("nonce %s is non-zero on a chain whose consensus fixes it at zero", h.Nonce)

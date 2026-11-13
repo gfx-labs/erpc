@@ -151,3 +151,45 @@ func TestHeaderInvariantsWiredPerArchitecture(t *testing.T) {
 	assert.Empty(t, params(42161)["zeroNonce"], "nitro uses a non-zero header nonce")
 	assert.Equal(t, "true", params(56)["zeroNonce"])
 }
+
+// Mainnet's PoS constants start at the Merge: every proof-of-work block before
+// it carries a non-zero difficulty and nonce, so judging them by the PoS
+// constants rejected all of mainnet's pre-Merge history. Real blocks on both
+// sides of the boundary, through the full chain-1 check set.
+func TestMainnetHeaderInvariantsActivateAtMerge(t *testing.T) {
+	cs := CheckSet{"headerConsensusInvariants": CheckConfig{Enabled: true}}
+	ApplyChainProfile(cs, 1)
+	assert.Equal(t, "15537394", cs["headerConsensusInvariants"].Params["activeFromBlock"])
+
+	fixtures := loadRealFixtures(t, "mainnet")
+	t.Run("last proof-of-work block is not judged on PoS constants", func(t *testing.T) {
+		res := validateFixture(t, 1, LevelIntrinsic, fixtures["block-premerge-hashonly"])
+		require.NoError(t, res.Err)
+		assert.Equal(t, "skip", outcomeOf(res, "headerConsensusInvariants"))
+	})
+	t.Run("PoS block is judged", func(t *testing.T) {
+		res := validateFixture(t, 1, LevelIntrinsic, fixtures["block-merge-hashonly"])
+		require.NoError(t, res.Err)
+		assert.Equal(t, "pass", outcomeOf(res, "headerConsensusInvariants"))
+	})
+
+	params := map[string]string{"activeFromBlock": "101", "zeroDifficulty": "true", "zeroNonce": "true"}
+	t.Run("boundary block is judged", func(t *testing.T) {
+		body := []byte(`{"number":"0x65","hash":"0xabc","parentHash":"0xpar","difficulty":"0x1","nonce":"0x0"}`)
+		require.Error(t, runHeaderCheck(t, body, params).Err)
+	})
+	t.Run("block before the boundary is not judged", func(t *testing.T) {
+		body := []byte(`{"number":"0x64","hash":"0xabc","parentHash":"0xpar","difficulty":"0x1","nonce":"0x1"}`)
+		res := runHeaderCheck(t, body, params)
+		require.NoError(t, res.Err)
+		assert.Equal(t, "skip", outcomeOf(res, "headerConsensusInvariants"))
+	})
+	t.Run("unreadable number is not judged", func(t *testing.T) {
+		body := []byte(`{"number":"zz","hash":"0xabc","parentHash":"0xpar","difficulty":"0x1","nonce":"0x1"}`)
+		require.NoError(t, runHeaderCheck(t, body, params).Err)
+	})
+	t.Run("blob granularity is independent of the boundary", func(t *testing.T) {
+		body := []byte(fmt.Sprintf(`{"number":"0x1","hash":"0xabc","parentHash":"0xpar","blobGasUsed":"0x%x"}`, gasPerBlob+1))
+		require.Error(t, runHeaderCheck(t, body, map[string]string{"activeFromBlock": "101", "blobGasMultiple": "true"}).Err)
+	})
+}

@@ -74,6 +74,11 @@ var ArbSysBlockNumber = &StateContextProbe{
 // arbitrum. Declaring false simply means "not guaranteed here", never "known to
 // be violated".
 type HeaderInvariants struct {
+	// ActiveFromBlock is the first block the constants below hold on (a
+	// chain that changed consensus regime, e.g. mainnet at the Merge); the
+	// regime before it is not judged. Zero means they hold from genesis.
+	// BlobGasMultiple is independent of it.
+	ActiveFromBlock uint64
 	// EmptyUncles — sha3Uncles is always the empty-ommers hash (no proof-of-work
 	// ommers are produced).
 	EmptyUncles bool
@@ -101,7 +106,9 @@ var postMergeHeader = &HeaderInvariants{EmptyUncles: true, ZeroDifficulty: true,
 
 // ethereumHeader adds the blob-granularity invariant, measured on mainnet and
 // NOT true of the OP Stack, so it cannot live in postMergeHeader.
-var ethereumHeader = &HeaderInvariants{EmptyUncles: true, ZeroDifficulty: true, ZeroNonce: true, BlobGasMultiple: true}
+// Its PoS constants hold from the Merge (block 15537394, the first PoS block):
+// every proof-of-work block before it has a non-zero difficulty and nonce.
+var ethereumHeader = &HeaderInvariants{ActiveFromBlock: 15537394, EmptyUncles: true, ZeroDifficulty: true, ZeroNonce: true, BlobGasMultiple: true}
 
 // recomputeFamily is the check set that synthetic/system transactions break:
 // the protocol commits them in the header roots but omits them from the RPC
