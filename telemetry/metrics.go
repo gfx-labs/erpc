@@ -318,6 +318,32 @@ var (
 		Help:      "Block clock fetches of a lane's chain tracker, by kind (rung, probe, retry, vote, catch_up, guarantee, holder, edge, cold, held, ahead) and outcome (new, early, behind, same, failed, joined, dropped, skipped_push).",
 	}, []string{"project", "network", "lane", "kind", "outcome"})
 
+	// MetricLeaderFetchRole is 1 while this instance holds the network's
+	// leader fetch lease (evm.chainTracker.leaderFetch), else 0.
+	MetricLeaderFetchRole = DefineGauge(prometheus.GaugeOpts{
+		Namespace: "erpc",
+		Name:      "leader_fetch_role",
+		Help:      "1 while this instance leads the network's head fetches (evm.chainTracker.leaderFetch), else 0.",
+	}, []string{"project", "network"})
+
+	// MetricLeaderFetchTransitionsTotal counts leader fetch role changes,
+	// by event: acquired, lost.
+	MetricLeaderFetchTransitionsTotal = DefineCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "leader_fetch_transitions_total",
+		Help:      "Leader fetch role changes of this instance, by event (acquired, lost).",
+	}, []string{"project", "network", "event"})
+
+	// MetricLeaderFetchHeadsTotal counts leader fetch heads: on the leader
+	// published or publish_failed; on a follower accepted, rejected
+	// (intake refused it), fenced (a deposed leader's epoch), malformed,
+	// unknown_upstream.
+	MetricLeaderFetchHeadsTotal = DefineCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "leader_fetch_heads_total",
+		Help:      "Leader fetch heads, by outcome (published, publish_failed, accepted, rejected, fenced, malformed, unknown_upstream).",
+	}, []string{"project", "network", "outcome"})
+
 	MetricHeadViewLagSeconds = DefineLabeledHistogram(prometheus.HistogramOpts{
 		Namespace: "erpc",
 		Name:      "head_view_lag_seconds",

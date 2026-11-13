@@ -794,6 +794,30 @@ func (t *ChainTracker) ClockRuns() bool {
 	return ok
 }
 
+// followsLeader is until when the network's leader fetch feeds this lane
+// (evm.leaderFetch): this instance follows a leader whose heads are
+// fresh until then, so the clock fetches nothing; zero when it does not.
+func (t *ChainTracker) followsLeader() (until time.Time) {
+	n, ok := t.network.(interface{ EvmClockLeaderUntil() time.Time })
+	if !ok {
+		return time.Time{}
+	}
+	t.callNetwork("leader-follows", func() { until = n.EvmClockLeaderUntil() })
+	return until
+}
+
+// MarkReadAll marks a read of every lane of n (MarkRead): a leader fetch
+// whose followers have demand keeps its clocks running for them.
+func MarkReadAll(n common.Network) {
+	nt := registeredTrackers(n)
+	if nt == nil {
+		return
+	}
+	for _, t := range nt.trackers() {
+		t.MarkRead()
+	}
+}
+
 // readDemand is how long a read of latest keeps the clock running: 2 W.
 // Reads W to 2 W apart then meet a running clock, not an idle edge: an
 // edge then costs q fetches, and a view up to W old serves no wait; reads
@@ -830,6 +854,18 @@ func (t *ChainTracker) runClock() {
 	}
 	waiting := edge != nil && c.edgeTo == 0
 	c.nextAt = time.Time{}
+	if until := t.followsLeader(); now.Before(until) {
+		// Another instance's leader fetch feeds the lane (evm.leaderFetch):
+		// its heads arrive as pushes, and this clock fetches nothing until
+		// they go stale, when it looks again. An idle edge ends at once:
+		// the view moves with the leader's next head.
+		c.scheduled, c.planned, c.ladder, c.rungs, c.votes, c.held = false, false, false, nil, nil, nil
+		c.nextAt = until
+		if edge != nil {
+			c.edgeDone, c.nextAt = true, now
+		}
+		return
+	}
 	pace, demanded := t.clockDemand(now)
 	if !demanded && edge == nil {
 		c.scheduled, c.planned, c.ladder, c.rungs, c.votes, c.held = false, false, false, nil, nil, nil

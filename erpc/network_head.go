@@ -373,6 +373,9 @@ func (n *Network) startHeads() {
 		if n.cacheHead != nil {
 			n.bg.Go(func() { n.cacheHead.Run(n.appCtx, n.cacheHeadDemand, n.cacheHeadPolled) })
 		}
+		if l := n.leader; l != nil {
+			n.bg.Go(func() { l.run(n.appCtx) })
+		}
 		n.bg.Go(func() {
 			ticker := time.NewTicker(every)
 			defer ticker.Stop()

@@ -171,6 +171,12 @@ func (in *networkIntake) Polled(upstreamId string, sh evm.SourceHeader, malforme
 	if u := in.upstream(upstreamId); passed && u != nil && kind != evm.HeaderReadFull {
 		in.nw.seedHeadBlock(u, sh)
 	}
+	// The leader publishes each head its own fetch of latest brought
+	// (evm.chainTracker.leaderFetch); a held block, the cache's poll and
+	// a relayed head are no such fetch.
+	if l := in.nw.leader; passed && l != nil && (kind == evm.HeaderPolled || kind == evm.HeaderForkPolled || kind == evm.HeaderReadFull) {
+		in.nw.bg.Go(func() { l.published(upstreamId, sh) })
+	}
 	return passed
 }
 

@@ -1426,11 +1426,19 @@ const (
 	// it says nothing of the node's head above it, so it bounds no hold of
 	// a later block (§6.8 hold bounds).
 	HeaderHeld
+	// HeaderLeader: a head another instance's leader fetch fetched and
+	// published (evm.leaderFetch): it votes as a poll does, an opt-in
+	// relaxation of "hash votes come only from own fetches" (spec §6.3),
+	// and reaches the block clock as a push does, since no fetch of this
+	// instance brought it.
+	HeaderLeader
 )
 
 // pushed: no fetch of the voter brought the header, so to the block clock
 // it arrives as a push does.
-func (k HeaderKind) pushed() bool { return k == HeaderStreamed || k == HeaderCached }
+func (k HeaderKind) pushed() bool {
+	return k == HeaderStreamed || k == HeaderCached || k == HeaderLeader
+}
 
 // PollIntake takes a bound poller's latest and finalized headers.
 type PollIntake interface {

@@ -137,6 +137,9 @@ type Network struct {
 	// non-EVM networks. bg runs the intake, reconciler and tap loops.
 	chainTracker *evm.ChainTracker
 	intake       *networkIntake
+	// leader is the opt-in leader fetch (evm.chainTracker.leaderFetch), nil
+	// when off.
+	leader *leaderFetch
 	sources      *sourceReconciler
 	taps         *indexer.Taps
 	mempool      *mempool.Feed
