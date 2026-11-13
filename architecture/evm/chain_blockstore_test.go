@@ -369,9 +369,14 @@ func TestChainStore_GetLogsHook(t *testing.T) {
 
 	_, ok := a.resolveReceipts(t.Context(), hash, -1)
 	require.True(t, ok)
-	handled, resp, err := HandleNetworkPreForward(t.Context(), na, nil, req(hit))
-	require.NoError(t, err)
-	require.True(t, handled)
+	// The fetch answers its waiter before the receipts are held and stored,
+	// so the fill sees them shortly after, not at once.
+	var resp *common.NormalizedResponse
+	require.Eventually(t, func() bool {
+		var h bool
+		h, resp, err = HandleNetworkPreForward(t.Context(), na, nil, req(hit))
+		return err == nil && h
+	}, 2*time.Second, 5*time.Millisecond)
 	require.True(t, resp.FromCache())
 	jrr, err := resp.JsonRpcResponse(t.Context())
 	require.NoError(t, err)
