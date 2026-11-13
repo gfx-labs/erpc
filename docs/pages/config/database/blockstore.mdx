@@ -1,0 +1,219 @@
+---
+title: Block store
+description: Share the chain tracker's block headers and receipts across replicas, serve small eth_getLogs ranges from them, and keep finalized blocks for catch-up readers.
+---
+
+import { LLMsTxtLink, AISection, ConfigTabs, SourceLink, PromptExample } from "../../../components";
+
+<LLMsTxtLink />
+
+# Block store
+
+Every eRPC replica's chain tracker fetches the receipts of recent blocks for logs
+subscriptions and integrity checks. Run ten replicas and each block's receipts are
+fetched ten times. The block store shares them: replicas read a block's receipts from
+a shared connector (Redis for a fleet) by block hash before asking an upstream, and
+write them back once every check passed. A fleet then costs about one upstream fetch
+per block.
+
+Nothing in the store is trusted on its own. Every read is checked again against the
+header the replica's own chain tracker holds, and any miss, bad entry or connector
+error falls back to the normal upstream fetch.
+
+Two optional extras build on it:
+
+- **Logs fill**: an `eth_getLogs` over a small explicit block range, at or below the
+  head, is answered by filtering complete per-block receipts locally, with any
+  `address`/`topics` filter. Any block without held or stored receipts sends the
+  request upstream as before.
+- **Historical**: blocks that become finalized are kept longer with a finalized
+  height-to-hash index, for indexers catching up below the live window.
+
+Everything is opt-in and off by default.
+
+## Quick taste
+
+Share receipts through the Redis connector of the EVM cache, and serve small log ranges:
+
+<ConfigTabs
+	path="projects[].networks[].evm.blockStore"
+	focusYaml="13-19"
+	focusTs="12-16"
+	yaml={`database:
+  evmJsonRpcCache:
+    connectors:
+      - id: redis
+        driver: redis
+        redis:
+          uri: redis://localhost:6379
+projects:
+  - id: main
+    networks:
+      - architecture: evm
+        evm:
+          chainId: 1
+          blockStore:
+            enabled: true
+            # a connector declared under database.evmJsonRpcCache
+            connectorId: redis
+            logsFill:
+              enabled: true`}
+	ts={`database: {
+  evmJsonRpcCache: {
+    connectors: [{ id: "redis", driver: "redis", redis: { uri: "redis://localhost:6379" } }],
+  },
+},
+projects: [{
+  id: "main",
+  networks: [{
+    architecture: "evm",
+    evm: {
+      chainId: 1,
+      blockStore: {
+        enabled: true,
+        // a connector declared under database.evmJsonRpcCache
+        connectorId: "redis",
+        logsFill: { enabled: true },
+      },
+    },
+  }],
+}]`}
+/>
+
+## Agent reference
+
+<PromptExample
+	n={1}
+	title="cut receipts load across replicas"
+	defaultOpen
+	prompt={`I run several eRPC replicas and each one fetches the same block receipts.
+Turn on the shared block store for my EVM networks using the Redis connector my
+eRPC config already has, and tell me which metrics show the saved upstream calls.
+Work with my existing eRPC config. Read the full reference first:
+https://docs.erpc.cloud/config/database/blockstore.llms.txt`}
+/>
+
+<PromptExample
+	n={2}
+	title="serve recent log polls locally"
+	prompt={`Many clients poll eth_getLogs over the last few blocks with different filters.
+Configure eRPC's block store logs fill so those are answered without upstream calls,
+and explain when a request still goes upstream. Reference:
+https://docs.erpc.cloud/config/database/blockstore.llms.txt`}
+/>
+
+<AISection
+	title="Block store: full agent reference"
+	hint="Schema, defaults, fallbacks, edge cases and metrics of evm.blockStore."
+>
+
+### How it works
+
+The block store sits under the chain tracker's fetch scheduler
+(<SourceLink file="architecture/evm/chain_fetch.go" />, `fetchScheduler.do`). Two
+fetch kinds go through it, both addressed by block hash: `eth_getBlockByHash` headers
+and `eth_getBlockReceipts` receipts. By-number fetches, `eth_getLogs` fallback fetches,
+refetches after a wrong answer and fetches aimed at one named upstream never touch the
+store: a number is not a block, logs from `eth_getLogs` prove less than receipts, and a
+refetch asks a specific upstream on purpose.
+
+For a shared fetch (<SourceLink file="architecture/evm/chain_blockstore.go" />,
+`readThrough`):
+
+1. Read the store. Receipts are validated against the header any tracker of the network
+   holds (`blockstore.ValidateReceipts`), then run through the tracker's own answer
+   check, the same one a sweep runs. A pass is the fetch's answer; no upstream call.
+2. Miss or invalid: try the block's lease (`data.Connector.Lock` on the configured
+   connector, one attempt of at most 100ms). Holding it, read once more, then sweep the
+   upstreams as before and store the answer.
+3. Another replica holds the lease: poll the store every 25ms for up to `peerWait`. The
+   holder's payload, once valid, is the answer. Otherwise sweep the upstreams anyway
+   (fail-open).
+
+An answer is written only after it passed the tracker's checks and, for receipts,
+`blockstore.ValidateReceipts` against a held header (see below). Receipts with no held
+header, from the logs fallback, with a bloom mismatch, or from the cache, are never
+written.
+
+**Receipts validation** (<SourceLink file="blockstore/validate.go" />): non-null and
+non-empty unless the header proves an empty block (`transactionsRoot` is the empty-trie
+root, or an empty transaction list); every receipt and log names the block's hash and
+number; no log is `removed`; transaction hashes are unique and every transaction the
+header lists has a receipt (extra receipts, such as system transactions some chains omit
+from the body, are allowed); `logIndex` strictly increases; the bloom recomputed from
+every log's address and topics equals the header's `logsBloom`, unless the chain profile
+disables `bloomMatch`. A header that repeats a transaction hash is rejected.
+
+**Logs fill** (`LogsFill`) runs in the network pre-forward hook of `eth_getLogs`
+(<SourceLink file="architecture/evm/eth_getLogs.go" />), after the hard range/address/topic
+limits and before any split. It serves only when every condition holds: both bounds are
+explicit hex numbers; no `blockHash`; the range is at most `logsFill.maxRange`; the
+range's top is at or below the network-wide tracker's view head; every block is pinned;
+and each pinned block either proves no match (empty block, or its recomputed-hash
+header's bloom excludes the filter) or has receipts held by the tracker or valid in the
+store. Logs are matched with `logfilter.LogsFilter.Matches` (geth `filterLogs`) and
+returned verbatim, in order, marked as from cache. Anything else continues down the
+normal path unchanged, cache read and bloom gate included.
+
+**Historical** (`PromoteFinalized`): while `historical.enabled`, a loop per network runs
+every block time (clamped to 2s..30s) and promotes each pin from the last promoted height
+up to the network's finalized head: it indexes height to hash (never replacing an
+existing entry), and rewrites the header and any stored or held receipts with
+`historical.ttl`. It fetches nothing: receipts no replica fetched are not kept.
+`HistoricalBlock` reads a height back, checking the header against the index and the
+receipts against the header.
+
+### Config schema
+
+Under `projects[].networks[].evm.blockStore` (or `networkDefaults.evm.blockStore`).
+Structs at <SourceLink file="common/config_blockstore.go" />, defaults at
+<SourceLink file="common/defaults.go" /> (`EvmBlockStoreConfig.SetDefaults`).
+
+| Field | Type | Default | Behavior / footguns |
+|---|---|---|---|
+| `enabled` | bool | `false` | Off: no store is attached and nothing changes. |
+| `connectorId` | string | none, required when enabled | Id of a connector under `database.evmJsonRpcCache.connectors`. Unknown id fails network init. A `memory` connector shares within one process only. |
+| `namespace` | string | `"default"` | Key prefix; isolates deployments sharing one Redis. |
+| `ttl` | Duration | `10m` | Lifetime of entries for blocks above finalized. |
+| `peerWait` | Duration | `1s` | How long a replica waits for a peer holding a block's lease. `0` disables leases (each replica still reads the store first). Validated to `0..10s`. |
+| `maxPayloadBytes` | int | `33554432` (32MB) | Larger payloads are neither written nor read. |
+| `logsFill.enabled` | bool | `false` | Turns the logs fill on. |
+| `logsFill.maxRange` | int | `10` | Widest `toBlock-fromBlock+1` served. Validated to `1..1000`. |
+| `historical.enabled` | bool | `false` | Turns finalized promotion on. |
+| `historical.ttl` | Duration | `24h` | Lifetime of promoted entries and index. |
+
+### Edge cases & gotchas
+
+1. The store never decides canonicality. A stored payload is used only for a hash the
+   reading replica asked for, and receipts only after validation against the header that
+   replica holds; with no held header, only the tracker's own answer check runs, as for
+   a cached answer, and such receipts are never written back.
+2. A peer that takes the lease and dies costs its waiters `peerWait` once, then they
+   fetch themselves; the lease expires after 10s.
+3. The logs fill serves only the network-wide tracker's view. Requests with a
+   `use-upstream` directive or `skip-cache-read` go upstream.
+4. A range sent as a tag (`latest`, `finalized`, absent bound) is never filled: it moves
+   with the head.
+5. On chains whose profile disables `bloomMatch`, the bloom recompute is skipped on both
+   write and read, and the fill uses no bloom to skip blocks.
+6. Promotion indexes only heights the tracker pins; a height already indexed with
+   another hash stays (`outcome="conflict"`).
+
+### Observability
+
+`erpc_blockstore_ops_total{project, network, kind, op, outcome}`:
+
+| kind | op | outcome |
+|---|---|---|
+| `header`, `receipts` | `get` | `hit`, `miss`, `error`, `too_large`, `invalid` |
+| `header`, `receipts` | `put` | `ok`, `error`, `too_large` |
+| `header`, `receipts` | `lease` | `acquired`, `waited`, `error`, `peer_hit`, `peer_timeout` |
+| `index` | `get` / `put` | `hit`, `miss`, `error` / `ok`, `conflict`, `error` |
+| `index` | `promote` | `ok`, `conflict` |
+| `logs` | `logs_fill` | `served`, `gap`, `unpinned`, `above_head` |
+
+Upstream savings show as fewer `erpc_chain_tracker_fetch_total{kind="receipts"}` with
+`outcome="ok"` per replica, since a store hit counts as an `ok` fetch that names no
+upstream.
+
+</AISection>

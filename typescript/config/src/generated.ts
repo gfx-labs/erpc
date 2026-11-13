@@ -2132,6 +2132,13 @@ export interface EvmNetworkConfig {
    * provider-defined routing. This does not affect eth_query* or gRPC Query.
    */
   safeBlockSource?: string;
+  /**
+   * BlockStore shares the chain tracker's block headers and receipts
+   * across replicas through a cache connector, serves small eth_getLogs
+   * ranges from them, and keeps finalized blocks for catch-up readers.
+   * Nil or disabled: no behaviour change.
+   */
+  blockStore?: EvmBlockStoreConfig;
 }
 /**
  * EvmChainTrackerConfig sizes the window a chain tracker holds.
@@ -2607,6 +2614,87 @@ export const RateLimitStoreFailureDeny: RateLimitStoreFailureMode = "deny";
  * counts every request, at maxCount × localLimitFactor.
  */
 export const RateLimitStoreFailureLocal: RateLimitStoreFailureMode = "local";
+
+//////////
+// source: config_blockstore.go
+
+/**
+ * EvmBlockStoreConfig configures the fleet-shared block store of an EVM
+ * network. The chain tracker's header and receipts fetches read through it
+ * by block hash and write to it once their checks pass, so N replicas cost
+ * about one upstream fetch per block. Every miss, invalid entry or store
+ * error falls back to the tracker's own upstream fetch.
+ */
+export interface EvmBlockStoreConfig {
+  /**
+   * Enabled turns the store on. Default false.
+   */
+  enabled?: boolean;
+  /**
+   * ConnectorId names a connector declared under
+   * database.evmJsonRpcCache.connectors (redis for a fleet; memory shares
+   * within one process only). Required when enabled.
+   */
+  connectorId?: string;
+  /**
+   * Namespace isolates deployments sharing one connector. Default "default".
+   */
+  namespace?: string;
+  /**
+   * TTL is the lifetime of entries for blocks above finalized. Default 10m.
+   */
+  ttl?: Duration;
+  /**
+   * PeerWait is how long a replica waits for another replica that is
+   * already fetching the same block before fetching itself. 0 turns
+   * coordination off (each replica still reads the store first). Default 1s.
+   */
+  peerWait?: Duration;
+  /**
+   * MaxPayloadBytes skips sharing any one header or receipts payload
+   * larger than this. Default 32MB.
+   */
+  maxPayloadBytes?: number /* int64 */;
+  /**
+   * LogsFill configures serving small eth_getLogs ranges from held or
+   * stored receipts.
+   */
+  logsFill?: EvmBlockStoreLogsFillConfig;
+  /**
+   * Historical configures keeping finalized blocks and receipts.
+   */
+  historical?: EvmBlockStoreHistoricalConfig;
+}
+/**
+ * EvmBlockStoreLogsFillConfig: an eth_getLogs with an explicit hex range of
+ * at most MaxRange blocks, every one pinned by the chain tracker, is
+ * answered by filtering each block's complete receipts locally. Any block
+ * whose receipts are neither held nor stored sends the request upstream.
+ */
+export interface EvmBlockStoreLogsFillConfig {
+  /**
+   * Enabled opts in. Default false.
+   */
+  enabled?: boolean;
+  /**
+   * MaxRange is the widest range (toBlock-fromBlock+1) served. Default 10.
+   */
+  maxRange?: number /* int64 */;
+}
+/**
+ * EvmBlockStoreHistoricalConfig: blocks that become finalized are kept
+ * with a finalized height->hash index for HistoricalTTL.
+ */
+export interface EvmBlockStoreHistoricalConfig {
+  /**
+   * Enabled opts in. Default false.
+   */
+  enabled?: boolean;
+  /**
+   * TTL is the lifetime of finalized entries. Default 24h.
+   */
+  ttl?: Duration;
+}
 
 //////////
 // source: config_integrity.go

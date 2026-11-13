@@ -55,40 +55,6 @@ type EvmBlockStoreHistoricalConfig struct {
 	TTL Duration `yaml:"ttl,omitempty" json:"ttl,omitempty" tstype:"Duration"`
 }
 
-// SetDefaults fills unset fields: namespace "default", ttl 10m, peerWait
-// 1s, maxPayloadBytes 32MB, logsFill.maxRange 10, historical.ttl 24h.
-func (c *EvmBlockStoreConfig) SetDefaults() {
-	if c == nil {
-		return
-	}
-	if c.Namespace == "" {
-		c.Namespace = "default"
-	}
-	if c.TTL == 0 {
-		c.TTL = Duration(10 * time.Minute)
-	}
-	if c.PeerWait == nil {
-		c.PeerWait = Duration(time.Second).Ptr()
-	}
-	if c.MaxPayloadBytes == 0 {
-		c.MaxPayloadBytes = 32 << 20
-	}
-	if c.LogsFill != nil {
-		cp := *c.LogsFill
-		c.LogsFill = &cp
-		if c.LogsFill.MaxRange == 0 {
-			c.LogsFill.MaxRange = 10
-		}
-	}
-	if c.Historical != nil {
-		cp := *c.Historical
-		c.Historical = &cp
-		if c.Historical.TTL == 0 {
-			c.Historical.TTL = Duration(24 * time.Hour)
-		}
-	}
-}
-
 // Validate checks an enabled store.
 func (c *EvmBlockStoreConfig) Validate() error {
 	if c == nil || !c.Enabled {

@@ -346,3 +346,44 @@ func TestChainStore_HistoricalPromotion(t *testing.T) {
 }
 
 var _ = indexer.Cursor{}
+
+// The eth_getLogs network hook answers a fill hit from the store, keeps
+// the request id, and leaves a gap, a tag range or a skip-cache request to
+// the normal path.
+func TestChainStore_GetLogsHook(t *testing.T) {
+	up := &fleetUpstream{receipts: map[string]json.RawMessage{}, calls: map[string]*atomic.Int32{}}
+	conn := fleetConnector(t)
+	na, a := newReplica(t, up, conn, fleetOpts(), 4)
+	hash, hdr, rec := blockFixture(1, testHash("e", 0), 2)
+	up.receipts[hash] = rec
+	a.Observe("src", hdr, true)
+	a.Sync(t.Context())
+
+	req := func(body string) *common.NormalizedRequest {
+		return common.NewNormalizedRequest([]byte(body))
+	}
+	const hit = `{"jsonrpc":"2.0","id":42,"method":"eth_getLogs","params":[{"fromBlock":"0x1","toBlock":"0x1"}]}`
+	handled, _, err := HandleNetworkPreForward(t.Context(), na, nil, req(hit))
+	require.NoError(t, err)
+	require.False(t, handled, "receipts not held: the request goes upstream")
+
+	_, ok := a.resolveReceipts(t.Context(), hash, -1)
+	require.True(t, ok)
+	handled, resp, err := HandleNetworkPreForward(t.Context(), na, nil, req(hit))
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.True(t, resp.FromCache())
+	jrr, err := resp.JsonRpcResponse(t.Context())
+	require.NoError(t, err)
+	var logs []json.RawMessage
+	require.NoError(t, json.Unmarshal(jrr.GetResultBytes(), &logs))
+	require.Len(t, logs, 2)
+	require.EqualValues(t, 42, jrr.ID())
+
+	handled, _, _ = HandleNetworkPreForward(t.Context(), na, nil, req(`{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{"fromBlock":"latest","toBlock":"latest"}]}`))
+	require.False(t, handled, "a tag range is not filled")
+	skip := req(hit)
+	skip.SetDirectives(&common.RequestDirectives{SkipCacheRead: "true"})
+	handled, _, _ = HandleNetworkPreForward(t.Context(), na, nil, skip)
+	require.False(t, handled, "skip-cache-read asks upstream")
+}

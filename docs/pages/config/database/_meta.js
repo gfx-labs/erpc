@@ -4,4 +4,5 @@ module.exports = {
 	drivers: { title: "Drivers" },
 	"goldsky-cache": { title: "Goldsky cache (gRPC)" },
 	"shared-state": { title: "Shared state" },
+	blockstore: { title: "Block store" },
 };
